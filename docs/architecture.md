@@ -73,23 +73,34 @@ Bablo InferenceEngine adapter]
 以下是边界形状，不是对 CPA API 的猜测；实际 CPA 适配以 `docs/upstream-compatibility.md` 锁定 tag 源码为准：
 
 ```go
-type InferenceEngine interface {
-    Execute(context.Context, InferenceRequest) (ExecutionResult, error)
-    ExecuteStream(context.Context, InferenceRequest) (Stream, error)
+type Engine interface {
+    Execute(context.Context, Request) (ExecutionResult, error)
+    ExecuteStream(context.Context, Request) (Stream, error)
     Capabilities(context.Context) (Capabilities, error)
     Shutdown(context.Context) error
 }
 
-type InferenceRequest struct {
-    RequestID       string
-    ResolvedModel   string
-    ProviderID      string
-    CredentialID    string
-    SourceFormat    string
-    ResponseFormat  string
-    Headers         map[string]string // 已过滤敏感头
-    Body            []byte             // 仅适配器边界；不进入普通日志/持久化
-    Stream          bool
+type Request struct {
+    RequestID      string
+    ResolvedRoute  ResolvedRoute
+    SourceFormat   string
+    ResponseFormat string
+    Headers        map[string][]string // 由 HTTP 层过滤敏感/hop-by-hop 头
+    Metadata       map[string]any      // 仅内部提示，不记录正文
+    Body           []byte              // 仅适配器边界；不进入普通日志/持久化
+    Stream         bool
+}
+
+type ResolvedRoute struct {
+    RouteID, RouteVersionID string
+    ProviderID, CredentialID string
+    RequestedModel, ResolvedModel string
+}
+
+type Stream interface {
+    Next(context.Context) (StreamEvent, error)
+    Headers() map[string][]string
+    Close() error
 }
 ```
 

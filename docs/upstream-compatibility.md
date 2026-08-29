@@ -1,7 +1,7 @@
 # CPA Upstream Compatibility
 
 > 核验日期：2026-08-29
-> 结论：建议首个锁定版本为 `v7.2.145`；当前仓库尚未建立 Go module，因此尚未完成 Bablo 编译/兼容测试。
+> 结论：已锁定并编译验证 `v7.2.145`；Bablo adapter 已落盘，真实上游凭据与协议 E2E 仍未验证。
 
 ## 1. 版本事实与来源
 
@@ -107,21 +107,48 @@ sdk/translator/builtin
 
 ## 5. Bablo 适配规则
 
-1. 生产依赖精确 pin `github.com/router-for-me/CLIProxyAPI/v7 v7.2.145`；不使用 `@latest`、main 或未审计 tag；
-2. 只有 `internal/inference/cpa/**` 可 import CPA 包；业务、handler、repository、billing、scheduler 只依赖 `internal/inference` 自有接口和 Bablo domain types；
-3. CPA adapter 自己负责 Build/Run/ready/Shutdown、能力探测、协议映射、stream/cancel、error classification、request ID 传播；
-4. credential 主数据和加密 secret 由 Bablo PostgreSQL 管理；如 CPA 需要 runtime artifact，由 Bablo 状态生成，不把 CPA 文件反向当事实源；
-5. CPA usage manager/queue 只作为观测或 reconcile signal，不直接入账；
-6. 禁止 import CPA `internal/*`。如果公开 API 无法满足生命周期/credential 需求，先写 ADR 并选择 loopback/公开 SDK 方案，而不是越界。
+1. 生产依赖精确 pin `github.com/router-for-me/CLIProxyAPI/v7 v7.2.145`；不使用 `@latest`、main 或未审计 tag；`go.mod`/`go.sum` 必须一起审查。
+2. 只有 `internal/inference/cpa/**` 可 import CPA 包；业务、handler、repository、billing、scheduler 只依赖 `internal/inference` 自有接口和 Bablo domain types。
+3. CPA adapter 使用公开 `Builder.Build`、`Service.Run`、`Service.Shutdown` 和 core auth Manager；CPA v7.2.145 没有公开 readiness API，Bablo 的 readyz 还必须由宿主服务基于 adapter 状态/依赖探针实现。
+4. adapter 负责能力快照、协议格式/请求头/路由凭据映射、stream/cancel、safe error classification、request ID metadata/header 传播；credential 主数据仍由 Bablo PostgreSQL 管理。
+5. CPA usage manager/queue 只作为观测或 reconcile signal，不直接入账；如 CPA 需要 runtime artifact，由 Bablo 状态生成，不把 CPA 文件反向当事实源。
+6. 禁止 import CPA `internal/*`。如果公开 API 无法满足 credential/runtime 需求，先写 ADR 并选择公开 SDK、受控 loopback 或暂时将能力标为 NO-GO，而不是越界。
 
 ## 6. 首次集成验证清单
 
-- Go 1.26.0/toolchain 与模块下载在 CI 和本机可复现；
-- adapter 编译契约锁定六个 ProviderExecutor 方法；
-- fake provider 覆盖 non-stream/stream、首包前后错误、429/401/5xx、cancel、request ID、executor shutdown；
-- translator 覆盖 Chat/Responses（后续协议按启用情况扩展）、tools/reasoning；
-- stream channel close、empty stream、partial output 后不 failover；
-- credential refresh/cooldown/fallback 与 scheduler decision；
-- 一个 Key 访问多个模型的端到端测试；
-- CPA tag 升级跑 compatibility + regression + race；
-- 将实际 import 列表、符号、编译命令和结果补回本文件。
+- [x] Go 1.26.0 module requirement 在 Go 1.27.0 本机通过依赖下载、编译和测试；
+- [x] adapter 编译契约锁定六个 `ProviderExecutor` 方法，且只在 `internal/inference/cpa` 使用 CPA import；
+- [x] fake provider 覆盖 non-stream/stream、stream headers/close、429/401/5xx、cancel、request ID、pinned credential、service build/shutdown；
+- [x] translator public format mapping 覆盖 OpenAI Responses、Claude；
+- [x] empty stream 已在 adapter 层拒绝；首包前后错误、partial output 后不 failover 仍需真实 proxy/上游协议阶段补齐；
+- [ ] credential refresh/cooldown/fallback 与 Bablo scheduler decision；CPA Manager 基础能力已核验，领域调度尚未实现；
+- [ ] 一个 Key 访问多个模型的端到端测试；依赖 apikey/models/router/proxy 阶段；
+- [ ] CPA tag 升级跑 compatibility + regression + race；当前仅完成锁定版本回归与 race；
+- [x] 实际 import 列表、符号、编译命令和结果已记录如下。
+
+## 7. 本次 adapter 实现证据
+
+实际代码位于 `internal/inference/cpa/adapter.go`、`stream.go`、`doc.go`；Bablo 稳定契约位于 `internal/inference/inference.go` 与 `errors.go`。adapter 使用的 CPA public symbols：
+
+```text
+sdk/auth.GetTokenStore
+sdk/config.LoadConfig
+sdk/cliproxy.NewBuilder
+sdk/cliproxy.Builder.WithConfig
+sdk/cliproxy.Builder.WithConfigPath
+sdk/cliproxy.Builder.WithCoreAuthManager
+sdk/cliproxy.Builder.Build
+sdk/cliproxy.Service.Run
+sdk/cliproxy.Service.Shutdown
+sdk/cliproxy/auth.NewManager
+sdk/cliproxy/auth.Manager.Register
+sdk/cliproxy/auth.Manager.RegisterExecutor
+sdk/cliproxy/auth.Manager.Execute
+sdk/cliproxy/auth.Manager.ExecuteStream
+sdk/cliproxy/auth.Manager.StopAutoRefresh
+sdk/cliproxy/executor.Request / Options / Response / StreamResult / StreamChunk
+sdk/cliproxy/executor.RequestedModelMetadataKey / PinnedAuthMetadataKey
+sdk/translator.Format* / FromString
+```
+
+验证命令及结果：`go test -count=1 ./...`、`go test -race -count=1 ./internal/inference/cpa`、`go vet ./...`、`go build -trimpath -o bin/bablo ./cmd/bablo` 均通过。fake provider 使用空 CPA model registry 做生命周期/错误/stream contract 测试；真实模型目录、协议翻译、首包后的 failover 仍必须在 `bablo-proxy` compatibility suite 验证，不能把本阶段测试当作真实上游 E2E。

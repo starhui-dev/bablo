@@ -17,7 +17,8 @@ type Request struct {
 	ResolvedRoute  ResolvedRoute
 	SourceFormat   string
 	ResponseFormat string
-	Headers        map[string]string
+	Headers        map[string][]string
+	Metadata       map[string]any
 	Body           []byte
 	Stream         bool
 }
@@ -35,13 +36,14 @@ type ResolvedRoute struct {
 // ExecutionResult is the non-streaming engine result.
 type ExecutionResult struct {
 	StatusCode int
-	Headers    map[string]string
+	Headers    map[string][]string
 	Body       []byte
 }
 
 // Stream is the Bablo-side streaming contract.
 type Stream interface {
 	Next(context.Context) (StreamEvent, error)
+	Headers() map[string][]string
 	Close() error
 }
 

@@ -1,5 +1,6 @@
 // Package cpa is the only Bablo package allowed to import CPA SDK packages.
 //
-// The adapter is intentionally empty until the cpa stage pins and verifies the
-// upstream SDK. Business packages must depend on package inference instead.
+// The package owns CPA service construction, lifecycle, protocol mapping, error
+// classification, and stream cancellation. Business packages depend only on
+// package inference and never receive CPA SDK values.
 package cpa
