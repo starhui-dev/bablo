@@ -32,7 +32,7 @@ Bablo InferenceEngine adapter]
 
 - `bablo`：HTTP server、CPA service、scheduler、usage settlement、outbox/quota worker；
 - PostgreSQL：唯一业务数据库；只允许私网/容器网络访问；
-- Redis：API Key 限流、预算快速门禁、credential concurrency lease、短 TTL affinity/cursor；丢失后可重建；
+- Redis：API Key RPM/TPM 固定分钟窗口计数、后续 Usage/Billing 驱动的预算快速门禁、credential concurrency lease、短 TTL affinity/cursor；全部状态可重建，配置 Redis 后错误 fail closed；未配置时只允许 P0 单实例使用进程内计数；
 - 反向代理/TLS：部署环境提供，域名不写死；
 - CPA management endpoint：不暴露公网，优先不启用远程管理。
 
@@ -54,7 +54,7 @@ Bablo InferenceEngine adapter]
 |---|---|---|---|
 | `user` | 用户生命周期、状态、角色关系 | user ID、profile、role | 推理 Key 校验、账本 SQL |
 | `auth` | `internal/auth` 已实现登录、Argon2id、Session、密码、TOTP/recovery、RBAC/CSRF；`bablo auth` 提供本地管理员维护 | session principal、authorization decision、一次性 Cookie/MFA enrollment material | 把 Web Session 当推理 API Key、在 handler 绕过 service 授权 |
-| `apikey` | Key 生成/hash、撤销、过期、轮换、限额 | key principal、policy ID | 保存明文 Key、绑定单一 group/provider |
+| `apikey` | Key CSPRNG 生成/SHA-256 hash、一次性明文、撤销、过期、原子轮换、IP/RPM/TPM/预算阈值、policy entitlement | key principal、policy/model authorization decision | 保存明文 Key、把 Key 绑定单一 group/provider、把 Redis 当权限事实源 |
 | `model` | public model、能力、visibility、billing class | model capability、provider model | 散落模型字符串、直接覆盖人工目录 |
 | `provider` | Provider 元数据、资源政策 | provider ID、resource type | 处理 OAuth secret 明文 |
 | `credential` | 加密 secret metadata、健康、pool membership | credential ID、lease input | 日志输出 token、让 subscription 默认商业可用 |
@@ -74,6 +74,12 @@ Bablo InferenceEngine adapter]
 `internal/auth.Handler -> auth.Service -> auth.Repository -> internal/data.Store`。Handler 只负责 JSON、Cookie、Origin/CSRF 传输校验和稳定错误；密码验证、Session rotation、管理员 MFA 与角色判断在 Service；所有身份事实、Session 撤销、MFA counter/recovery code 消费和 audit 在 PostgreSQL 事务内完成。前端只消费 Bablo Session DTO，不接触 hash、MFA ciphertext 或数据库类型。
 
 P0 登录/MFA limiter 是有容量上限和自动过期的进程内状态，符合单实例首发边界；HA 前必须迁移为 Redis 协调实现。PostgreSQL 仍是用户、角色、Session 撤销、MFA 和 audit 的唯一事实源，Redis 丢失不能恢复权限或 Session。
+
+### API Key 调用边界
+
+`internal/apikey.Handler -> apikey.Service -> apikey.Repository -> internal/data.Store`。Web Session `auth.Handler.Protect` 只为用户自助 Key API 提供 full-session、Origin 和 CSRF 边界；推理面只通过 `Authorization: Bearer` 进入 `apikey.Service.IdentityMiddleware`，上下文只携带内部 user/key ID、prefix、secret version 和限额，不携带 raw key/hash。实际推理 handler 在解析请求模型和 token 估算后必须继续调用 `Service.Authorize`，以当前 user/key/secret version 重新检查有效性，再完成 model entitlement 与 RPM/TPM 门禁，不能只依赖身份中间件。
+
+每个用户创建的 Key 拥有 default-deny managed policy；一个 policy 可允许多个 public model，显式 deny 优先于 allow。轮换原子替换同一 Key 的 hash，旧 secret 立即失效；P0 不提供双 Key 并行窗口。PostgreSQL 保存 Key、policy、授权和撤销事实；Redis 仅保存带 TTL 的固定窗口计数，Redis 丢失不能恢复权限或撤销状态。daily/monthly budget 阈值已进入 Key principal，真正消费门禁必须等待 Usage/Billing 事实源，不能把“尚无消费数据”伪装为零消费。
 
 ## 4. 稳定领域接口
 

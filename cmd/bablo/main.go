@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/starhui-dev/bablo/internal/apikey"
 	"github.com/starhui-dev/bablo/internal/auth"
 	"github.com/starhui-dev/bablo/internal/config"
 	"github.com/starhui-dev/bablo/internal/data"
@@ -45,6 +46,8 @@ func run(arguments []string) int {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	var store *data.Store
+	var authHandler *auth.Handler
+	var redisReady bool
 	var serverOptions []httpapi.Option
 	if cfg.DatabaseURL != "" {
 		connectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -77,7 +80,7 @@ func run(arguments []string) int {
 				logger.Error("bablo_auth_service_error", "error", err)
 				return 1
 			}
-			handler, err := auth.NewHandler(service, logger, auth.HandlerConfig{
+			authHandler, err = auth.NewHandler(service, logger, auth.HandlerConfig{
 				AllowedOrigin: authCfg.AllowedOrigin,
 				CookieDomain:  authCfg.CookieDomain,
 				CookieSecure:  authCfg.CookieSecure,
@@ -87,7 +90,45 @@ func run(arguments []string) int {
 				logger.Error("bablo_auth_handler_error", "error", err)
 				return 1
 			}
-			serverOptions = append(serverOptions, httpapi.WithAuthHandler(handler))
+			serverOptions = append(serverOptions, httpapi.WithAuthHandler(authHandler))
+		}
+
+		var limiter apikey.Limiter
+		if cfg.RedisURL != "" {
+			redisCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			limiter, err = apikey.NewRedisLimiter(redisCtx, cfg.RedisURL)
+			cancel()
+			if err != nil {
+				logger.Error("bablo_redis_error", "error", err)
+				return 1
+			}
+			redisReady = true
+		} else {
+			limiter = apikey.NewMemoryLimiter()
+		}
+		defer func() {
+			if err := limiter.Close(); err != nil {
+				logger.Error("bablo_apikey_limiter_close_error", "error", err)
+			}
+		}()
+
+		apiKeyRepository, err := apikey.NewRepository(store)
+		if err != nil {
+			logger.Error("bablo_apikey_repository_error", "error", err)
+			return 1
+		}
+		apiKeyService, err := apikey.NewService(apiKeyRepository, limiter)
+		if err != nil {
+			logger.Error("bablo_apikey_service_error", "error", err)
+			return 1
+		}
+		apiKeyHandler, err := apikey.NewHandler(apiKeyService, logger)
+		if err != nil {
+			logger.Error("bablo_apikey_handler_error", "error", err)
+			return 1
+		}
+		if authHandler != nil {
+			serverOptions = append(serverOptions, httpapi.WithAPIKeyHandler(authHandler.Protect(apiKeyHandler)))
 		}
 	} else if len(authCfg.EncryptionKey) > 0 {
 		logger.Error("bablo_auth_database_error", "error", "BABLO_DATABASE_URL is required when authentication is configured")
@@ -97,6 +138,9 @@ func run(arguments []string) int {
 	server := httpapi.New(cfg, logger, buildVersion, serverOptions...)
 	if store != nil {
 		server.SetDependencyReady("postgres", true)
+	}
+	if redisReady {
+		server.SetDependencyReady("redis", true)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

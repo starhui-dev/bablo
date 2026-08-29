@@ -14,13 +14,14 @@ import (
 
 // Server is the Bablo HTTP server. Domain handlers are added in later stages.
 type Server struct {
-	config       config.Config
-	logger       *slog.Logger
-	version      string
-	httpServer   *http.Server
-	requestCount atomic.Uint64
-	readiness    *Readiness
-	authHandler  http.Handler
+	config        config.Config
+	logger        *slog.Logger
+	version       string
+	httpServer    *http.Server
+	requestCount  atomic.Uint64
+	readiness     *Readiness
+	authHandler   http.Handler
+	apiKeyHandler http.Handler
 }
 
 // Option configures optional domain HTTP surfaces.
@@ -30,6 +31,13 @@ type Option func(*Server)
 func WithAuthHandler(handler http.Handler) Option {
 	return func(server *Server) {
 		server.authHandler = handler
+	}
+}
+
+// WithAPIKeyHandler mounts the protected user API Key surface.
+func WithAPIKeyHandler(handler http.Handler) Option {
+	return func(server *Server) {
+		server.apiKeyHandler = handler
 	}
 }
 
@@ -106,6 +114,10 @@ func (s *Server) routes() http.Handler {
 	}
 	mux.Handle("/api/v1/auth/", authHandler)
 	mux.Handle("/api/v1/admin/users/", authHandler)
+	if s.apiKeyHandler != nil {
+		mux.Handle("/api/v1/me/api-keys", s.apiKeyHandler)
+		mux.Handle("/api/v1/me/api-keys/", s.apiKeyHandler)
+	}
 	mux.HandleFunc("/", s.notFound)
 	return withRequestID(mux, s.logger, &s.requestCount)
 }

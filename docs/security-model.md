@@ -33,13 +33,15 @@
 - `bablo auth create-admin --email ...` 与 `bablo auth reset-password --email ...` 是本地可信运维入口，密码从无回显终端或 stdin 读取，不进入 argv；重置在单事务内更新 hash、撤销全部 Session、写 audit。没有可靠邮件基础设施时不伪造邮件重置；
 - 登录成功/失败、MFA 开始/启用/验证/恢复码重建、密码变更/重置和注销写 `audit_logs`；不记录密码、TOTP secret、恢复码、Cookie 或请求正文。
 
-### 推理面
+### 推理面（API Key P0）
 
-- 只接受 `Authorization: Bearer`（兼容其他 header 前必须单独设计并测试）；
-- Key 由 CSPRNG 生成，创建响应只返回一次明文；持久层 `secret_hash + prefix + metadata`；
-- 每次请求检查 active/revoked/expired、owner/policy、model entitlement、IP、RPM/TPM 和预算；上下文只放内部 user/key ID，不放明文 Key；
-- policy 采用默认拒绝；Key -> policy/entitlement -> model route，绝不使用单一 group/provider 绑定；
-- 轮换的旧 Key 窗口若启用必须有明确 TTL、同时审计和撤销语义。
+- 只接受严格的单一 `Authorization: Bearer`（兼容其他 header 前必须单独设计并测试）；Key 格式为 `bablo_sk_` + 32-byte CSPRNG base64url；
+- 创建和轮换响应只返回一次明文；持久层只保存完整 Key 的 SHA-256、短 prefix 和 metadata。256-bit 随机熵使离线猜测不可行，同时避免可逆 secret 存储；日志、audit、错误和 context 均不得含 raw key/hash；
+- 身份中间件每次检查 active/revoked/expired、active owner 和 canonical CIDR IP allowlist，只信任直连 `RemoteAddr`，不信任客户端提供的 forwarded headers；上下文只放内部 user/key ID、prefix、secret version 和限额，授权阶段再次比对当前版本，使 rotate 提交前取得的陈旧 Principal 失效；
+- 推理 handler 在解析 requested model 与 token 估算后必须调用授权服务：policy default deny，显式 deny 优先、allow 次之，一个 Key 可允许多个模型；随后执行 RPM/TPM 固定 UTC 分钟窗口门禁；
+- PostgreSQL 是 Key、policy、entitlement、撤销和轮换事实源。配置 Redis 时 Lua 原子计数且错误 fail closed；未配置 Redis 只允许 P0 单实例使用有界进程内计数，不能作为 HA 方案；
+- daily/monthly budget 阈值已保存并进入 Principal，但真实消费门禁必须等 Usage/Billing 提供可核验消费事实；在此前不得假装预算已经执行；
+- P0 轮换原子替换同一 Key 的 hash，旧 Key 立即失效并写 audit；不提供难以证明撤销边界的双 Key 并行窗口。
 
 ## 3. Secret 与加密
 

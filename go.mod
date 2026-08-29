@@ -7,6 +7,7 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pquerna/otp v1.5.0
 	github.com/pressly/goose/v3 v3.27.3
+	github.com/redis/go-redis/v9 v9.19.0
 	github.com/router-for-me/CLIProxyAPI/v7 v7.2.145
 	golang.org/x/crypto v0.54.0
 	golang.org/x/term v0.45.0
@@ -60,7 +61,6 @@ require (
 	github.com/pion/transport/v4 v4.0.2 // indirect
 	github.com/pion/turn/v5 v5.0.12 // indirect
 	github.com/pion/webrtc/v4 v4.2.17 // indirect
-	github.com/redis/go-redis/v9 v9.19.0 // indirect
 	github.com/refraction-networking/utls v1.8.2 // indirect
 	github.com/sethvargo/go-retry v0.4.0 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect

@@ -68,6 +68,20 @@ func TestReadyzIsConservativeBeforeDependenciesInitialize(t *testing.T) {
 	}
 }
 
+func TestReadyzAllowsDocumentedSingleInstanceMemoryLimiter(t *testing.T) {
+	server := New(config.Config{HTTPAddr: ":0", DatabaseURL: "configured"}, slog.New(slog.NewTextHandler(io.Discard, nil)), "test")
+	server.SetDependencyReady("postgres", true)
+	server.SetDependencyReady("inference", true)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"redis":"not_configured"`) {
+		t.Fatalf("body = %q, want honest Redis fallback state", recorder.Body.String())
+	}
+}
+
 func TestUnknownPathReturnsJSONNotFound(t *testing.T) {
 	server := testServer()
 	recorder := httptest.NewRecorder()
@@ -95,5 +109,31 @@ func TestAuthSurfaceFailsClosedWhenUnavailable(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), `"code":"auth_unavailable"`) || !strings.Contains(recorder.Body.String(), `"request_id":"req_`) {
 		t.Fatalf("body = %q, want stable auth_unavailable envelope", recorder.Body.String())
+	}
+}
+
+func TestAPIKeySurfaceMountsOnlyConfiguredPaths(t *testing.T) {
+	called := 0
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called++
+		w.WriteHeader(http.StatusNoContent)
+	})
+	server := New(config.Config{HTTPAddr: ":0"}, slog.New(slog.NewTextHandler(io.Discard, nil)), "test", WithAPIKeyHandler(handler))
+	for _, path := range []string{"/api/v1/me/api-keys", "/api/v1/me/api-keys/key-id/rotate"} {
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("path %s status = %d, want 204", path, recorder.Code)
+		}
+	}
+	if called != 2 {
+		t.Fatalf("API key handler calls = %d, want 2", called)
+	}
+
+	unconfigured := testServer()
+	recorder := httptest.NewRecorder()
+	unconfigured.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/me/api-keys", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("unconfigured API key status = %d, want 404", recorder.Code)
 	}
 }

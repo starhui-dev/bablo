@@ -58,8 +58,8 @@ erDiagram
 - `roles`、`user_roles`：至少 `admin`、`user`；角色变更写 audit；
 - `user_sessions`：`id`, `user_id`, unique `token_hash`, `csrf_token_hash`, `expires_at`, `revoked_at`, `mfa_verified_at`, `last_seen_at`, device metadata；数据库不存明文 Session/CSRF token；
 - `mfa_factors`：每个 `(user_id, factor_type)` 唯一；TOTP 保存 AEAD ciphertext/nonce/key_version、enabled/confirmed、`last_totp_counter`；恢复码只存 hash 和 `consumed_at`，条件 UPDATE 单次消费；
-- `api_keys`：`id`, `user_id`, `name`, `prefix`, `secret_hash`, `status`, `expires_at`, IP policy, RPM/TPM/daily/monthly budget, `last_used_at`；没有 `group_id`/单一 `provider_id`；
-- `policies`、`api_key_policies`、`policy_model_entitlements`：表达 Key -> policy -> 多模型 entitlement；deny 优先级和默认拒绝策略在 service 层固定并测试。
+- `api_keys`：`id`, `user_id`, `name`, `key_prefix`, `secret_hash`, `secret_version`, `status`, `expires_at`, canonical CIDR IP policy, RPM/TPM/daily/monthly budget, `last_used_at`, `rotated_at`, `created_at`, `updated_at`；Key 使用 `bablo_sk_` + 32-byte CSPRNG base64url，数据库只保存完整 Key 的 SHA-256 与展示 prefix，没有 `group_id`/单一 `provider_id`；
+- `policies`、`api_key_policies`、`policy_model_entitlements`：表达 Key -> policy -> 多模型 entitlement；用户 Key 使用 metadata 标识的 managed policy 和 default deny，显式 deny 优先于 allow，最后才考虑 policy default action；授权替换与 Key 更新在同一事务内完成。
 
 ### Catalog / route / credential
 

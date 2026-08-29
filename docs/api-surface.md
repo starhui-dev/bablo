@@ -67,21 +67,42 @@ bablo auth reset-password --email user@example.com
 
 密码从无回显终端或 stdin 读取，不进入命令行参数；操作更新 audit，密码重置撤销全部 Session。
 
-### 用户 API Key / policy
+### 用户 API Key / policy（P0 已实现）
 
-- `GET /api/v1/me`
 - `GET /api/v1/me/api-keys`
-- `POST /api/v1/me/api-keys`：明文只在创建响应返回一次；
-- `PATCH /api/v1/me/api-keys/{id}`：名称、到期和限额；
+- `POST /api/v1/me/api-keys`
+- `PATCH /api/v1/me/api-keys/{id}`
 - `POST /api/v1/me/api-keys/{id}/rotate`
 - `POST /api/v1/me/api-keys/{id}/revoke`
-- `GET /api/v1/me/models`
-- `GET /api/v1/me/usage`
-- `GET /api/v1/me/wallet`
-- `GET /api/v1/me/wallet/ledger`
-- `GET /api/v1/me/payment-orders/{order_no}`
+- `GET /api/v1/me/models`（model 阶段）
+- `GET /api/v1/me/usage`（usage/stats 阶段）
+- `GET /api/v1/me/wallet`、`GET /api/v1/me/wallet/ledger`（billing 阶段）
+- `GET /api/v1/me/payment-orders/{order_no}`（payment 阶段）
 
-Key API 不提供 `group_id`/`provider_id` 绑定字段；多模型授权通过 policy/entitlement 管理。
+以上 Key 管理接口只接受现有 Web Session：所有方法要求 full session，POST/PATCH 继续要求精确 Origin、CSRF Cookie 与 `X-CSRF-Token`。用户查询和修改条件始终包含 session user ID；其他用户的 Key 返回 `not_found`。响应统一 `Cache-Control: no-store`。
+
+创建请求：
+
+```json
+{
+  "name": "development",
+  "expires_at": "2026-12-31T23:59:59Z",
+  "allowed_models": ["gpt-example-a", "gpt-example-b"],
+  "ip_allowlist": ["203.0.113.0/24", "2001:db8::/32"],
+  "rpm_limit": 60,
+  "tpm_limit": 100000,
+  "daily_budget_minor": 10000,
+  "monthly_budget_minor": 200000
+}
+```
+
+`allowed_models` 只接受 enabled/public/non-deleted catalog ID，可为空以建立默认拒绝且暂不可用的 Key。IP 可传 CIDR 或单 IP，服务端保存 canonical CIDR；空 allowlist 允许任意直连源。RPM/TPM 必须为正数，预算阈值不得为负。PATCH 支持同名字段；`expires_at`、RPM/TPM、daily/monthly budget 传 `null` 表示清除，`allowed_models: []` 清空授权，`ip_allowlist: []` 清空 IP 限制。未知字段、空 patch、过去到期时间和无效模型/IP/限额返回 400。
+
+创建成功返回 201，轮换成功返回 200；只有这两个响应包含一次性 `secret`。普通 Key DTO 只含 `id/name/prefix/status/expires_at/allowed_models/ip_allowlist/limits/last_used_at/timestamps/secret_version`，从不含 `secret` 或 `secret_hash`。P0 rotate 原子替换同一记录，旧 Key 在事务提交后立即无效；revoke 幂等并立即无效。
+
+推理面严格接受单一 `Authorization: Bearer bablo_sk_...`。`IdentityMiddleware` 只完成 Key/owner/revoked/expired/IP 身份检查并把内部 Principal 放 context；推理 handler 解析 requested model 和 token 估算后必须调用 `Service.Authorize` 完成 deny-precedence entitlement 与 RPM/TPM 门禁。当前只信任直连 `RemoteAddr`，不读取客户端 `X-Forwarded-For`。daily/monthly budget 阈值已进入 Principal，但消费门禁等待 Usage/Billing 事实源完成。
+
+稳定错误 code 包括 `invalid_api_key`（401）、`ip_not_allowed`/`model_not_allowed`（403）、`rate_limited`（429，`Retry-After: 60`）、`rate_limit_unavailable`（503）、`not_found`（404）、`conflict`（409）和 `invalid_request`（400）。Key API 不提供 `group_id`/`provider_id` 绑定字段；多模型授权只通过 policy/entitlement 管理。
 
 ### 管理资源
 

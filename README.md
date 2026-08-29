@@ -37,12 +37,13 @@ github.com/router-for-me/CLIProxyAPI/v7 v7.2.145
 - [ADR：PostgreSQL 事实源](docs/adr/0002-postgres-source-of-truth.md)
 - [ADR：Usage/Ledger 计费](docs/adr/0003-usage-ledger-billing.md)
 - [ADR：模型路由与 Scheduler](docs/adr/0004-model-routing-and-scheduler.md)
+- [ADR：Web Session 认证](docs/adr/0005-web-session-authentication.md)
 
 ## 实施顺序
 
-项目按 `docs/implementation-status.md` 中的阶段顺序推进：bootstrap 已完成，下一步建立 CPA adapter 和兼容测试，再实现数据层、认证、Key、多模型路由、调度、推理数据面、Usage/账务，最后完成可观测性、安全、测试、压测、部署、CI 和上线门禁。
+项目按 `docs/implementation-status.md` 中的阶段顺序推进。plan、bootstrap、CPA adapter、data layer、Web Session auth 与 API Key 已完成；后续依次实现模型目录、Credential、路由、调度、推理数据面、Usage/账务，再完成可观测性、安全、测试、压测、部署、CI 和上线门禁。
 
-下一阶段：`/bablo-cpa`。
+下一阶段：`/bablo-models`。
 
 ## 安全与上线
 

@@ -50,7 +50,7 @@ func (r *Readiness) Snapshot() (bool, map[string]string) {
 	ready := true
 	for name, state := range r.checks {
 		checks[name] = state
-		if state != "ok" {
+		if state != "ok" && !(name == "redis" && state == "not_configured") {
 			ready = false
 		}
 	}

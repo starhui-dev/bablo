@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -65,6 +66,42 @@ func NewHandler(service *Service, logger *slog.Logger, cfg HandlerConfig) (*Hand
 	handler.mux.HandleFunc("POST /api/v1/auth/mfa/recovery/regenerate", handler.regenerateRecoveryCodes)
 	handler.mux.HandleFunc("POST /api/v1/admin/users/{user_id}/password", handler.adminResetPassword)
 	return handler, nil
+}
+
+type sessionContextKey struct{}
+
+// SessionFromContext returns the full Web Session established by Protect.
+func SessionFromContext(ctx context.Context) (Session, bool) {
+	session, ok := ctx.Value(sessionContextKey{}).(Session)
+	return session, ok
+}
+
+// Protect authenticates a full Web Session around a user control-plane
+// handler. Unsafe methods also require the existing Origin and CSRF checks.
+func (h *Handler) Protect(next http.Handler) http.Handler {
+	if next == nil {
+		next = http.NotFoundHandler()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var (
+			session Session
+			err     error
+		)
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			session, err = h.authenticate(r)
+		default:
+			session, err = h.authenticatedMutation(r)
+		}
+		if err == nil {
+			err = h.service.RequireFullSession(session)
+		}
+		if err != nil {
+			h.writeError(w, r, err)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), sessionContextKey{}, session)))
+	})
 }
 
 // ServeHTTP dispatches authentication routes with the same JSON error envelope

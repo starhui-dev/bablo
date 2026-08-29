@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/starhui-dev/bablo/internal/audit"
 	"github.com/starhui-dev/bablo/internal/data"
 	"github.com/starhui-dev/bablo/internal/id"
 )
@@ -394,24 +395,18 @@ func insertAudit(ctx context.Context, q data.Querier, actorID *uuid.UUID, action
 }
 
 func insertAuditPointer(ctx context.Context, q data.Querier, actorID *uuid.UUID, action, targetType string, targetID *uuid.UUID, requestID, result string) error {
-	auditID, err := newUUID()
-	if err != nil {
-		return err
-	}
-	target := "unknown"
+	target := ""
 	if targetID != nil {
 		target = targetID.String()
 	}
-	if _, err := q.Exec(ctx, `
-		INSERT INTO audit_logs (
-			id, event_id, actor_user_id, action, target_type, target_id, request_id, result
-		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		auditID, "evt_"+auditID.String(), actorID, action, targetType, target, nullIfEmpty(requestID), result,
-	); err != nil {
-		return fmt.Errorf("insert audit log: %w", err)
-	}
-	return nil
+	return audit.Insert(ctx, q, audit.Event{
+		ActorUserID: actorID,
+		Action:      action,
+		TargetType:  targetType,
+		TargetID:    target,
+		RequestID:   requestID,
+		Result:      result,
+	})
 }
 
 func mapConflict(operation string, err error) error {
@@ -428,11 +423,4 @@ func newUUID() (uuid.UUID, error) {
 		return uuid.Nil, fmt.Errorf("generate UUIDv7: %w", err)
 	}
 	return generated, nil
-}
-
-func nullIfEmpty(value string) any {
-	if value == "" {
-		return nil
-	}
-	return value
 }

@@ -33,7 +33,7 @@ func TestMigrationsUpgradeAndRepeatSafely(t *testing.T) {
 	if _, err := provider.Up(ctx); err != nil {
 		t.Fatalf("upgrade to latest: %v", err)
 	}
-	if version, err := provider.GetDBVersion(ctx); err != nil || version != 4 {
+	if version, err := provider.GetDBVersion(ctx); err != nil || version != 5 {
 		t.Fatalf("version after upgrade = %d, %v", version, err)
 	}
 	results, err := provider.Up(ctx)
@@ -89,6 +89,18 @@ func TestCoreSchemaConstraints(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed core schema: %v", err)
 	}
+
+	var secretVersion int64
+	var keyUpdatedAt time.Time
+	if err := store.Queryer().QueryRow(ctx, `
+		SELECT secret_version, updated_at FROM api_keys WHERE id = $1`, keyID).Scan(&secretVersion, &keyUpdatedAt); err != nil {
+		t.Fatalf("query API key security defaults: %v", err)
+	}
+	if secretVersion != 1 || keyUpdatedAt.IsZero() {
+		t.Fatalf("API key security defaults = version %d, updated_at %v", secretVersion, keyUpdatedAt)
+	}
+	_, err = store.Queryer().Exec(ctx, `UPDATE api_keys SET secret_version = 0 WHERE id = $1`, keyID)
+	assertPostgresCode(t, err, "23514")
 
 	var entitlementCount int
 	if err := store.Queryer().QueryRow(ctx, `SELECT count(*) FROM policy_model_entitlements WHERE policy_id = $1`, policyID).Scan(&entitlementCount); err != nil {
