@@ -33,7 +33,7 @@ func TestMigrationsUpgradeAndRepeatSafely(t *testing.T) {
 	if _, err := provider.Up(ctx); err != nil {
 		t.Fatalf("upgrade to latest: %v", err)
 	}
-	if version, err := provider.GetDBVersion(ctx); err != nil || version != 3 {
+	if version, err := provider.GetDBVersion(ctx); err != nil || version != 4 {
 		t.Fatalf("version after upgrade = %d, %v", version, err)
 	}
 	results, err := provider.Up(ctx)

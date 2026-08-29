@@ -1,19 +1,19 @@
 # Bablo 实施状态
 
 > 最后更新：2026-08-29
-> 本次工作：完成 PostgreSQL 核心 schema、事实表保护、pgx 连接池、Goose 迁移入口、UUIDv7 生成器与数据层事务契约测试；认证业务尚未实现
+> 本次工作：完成 P0 Web Session 认证、Argon2id、CSRF、RBAC、管理员 TOTP/恢复码、本地管理员维护流程、认证迁移与 Vue 登录/退出接入
 
 ## 1. 仓库审计结果
 
 | 项目 | 观察结果 | 证据/影响 |
 |---|---|---|
 | 根目录 | `.omp/`、`docs/`、Go/Vue bootstrap 文件 | 保留既有提示词与规划文档，新增实现文件 |
-| 后端 | 已建立 `go.mod`、`cmd/bablo/`、`internal/config`、`internal/httpapi`、`internal/inference` 和 CPA adapter | module 为 `github.com/starhui-dev/bablo`，CPA 仅在 adapter 边界 import |
-| 前端 | 已建立 Vue 3 + TypeScript + Vite + pnpm shell、路由、API client、登录/Dashboard/404 页面 | `web/package.json`、`web/pnpm-lock.yaml` |
-| 数据库 | 已落地 `migrations/000001_initial_schema.sql`、`000002_fact_table_guards.sql`、`000003_wallet_payment_integrity.sql`，覆盖规划核心实体和关键唯一约束 | `cmd/bablo-migrate` 显式执行 up/down；应用启动不自动改 schema |
+| 后端 | 已建立 Go bootstrap、CPA adapter、data layer 与 `internal/auth`；`cmd/bablo` 同时提供服务启动和本地认证维护子命令 | auth 依赖 `internal/data`，不与推理 API Key 混用；CPA 仍只在 adapter 边界 import |
+| 前端 | Vue 登录页已接通 Session/MFA 登录、CSRF header、路由守卫和退出；Dashboard/404 仍为后续业务壳 | `web/src/lib/api.ts`、`LoginView.vue`、`router.ts`、`AppShell.vue` |
+| 数据库 | 已落地 `000001`–`000004` migrations；`000004_auth_security.sql` 增加 password changed、Session CSRF/MFA 和 TOTP replay 字段/约束 | `cmd/bablo-migrate` 显式执行 up/down；应用启动不自动改 schema |
 | CI/部署 | 已有 `Dockerfile`、`deploy/compose.dev.yaml`；尚无 CI workflow/生产部署 runbook | Compose 仅作为开发基础设施，生产硬化留到后续阶段 |
 | 文档 | 架构规划、ADR、README、LICENSE、CPA compatibility 证据均已存在 | 已更新实际 import/symbol/测试结果 |
-| Git | 已关联 `origin` 到 `git@github.com:starhui-dev/bablo.git` | 当前数据阶段修改尚未提交，不覆盖用户既有工作 |
+| Git | 已关联 `origin` 到 `git@github.com:starhui-dev/bablo.git` | 当前认证阶段修改尚未提交，未覆盖用户既有工作 |
 | CPA 本地使用 | `go.mod` 精确 pin `v7.2.145`；adapter Build/Run/Shutdown、Manager Execute/Stream 和映射测试已落盘 | 真实 Provider/OAuth E2E 仍缺外部凭据 |
 
 ## 2. 已落盘的规划
@@ -24,7 +24,7 @@
 - [x] `docs/api-surface.md`：管理面、推理面、支付面、错误和 streaming 契约；
 - [x] `docs/security-model.md`：威胁边界、密钥、认证、SSRF、支付、隐私、部署；
 - [x] `docs/upstream-compatibility.md`：CPA tag/commit/Go/package、漂移和 adapter 规则；
-- [x] 四份 ADR：CPA boundary、PostgreSQL source-of-truth、Usage/Ledger billing、routing/scheduler；
+- [x] 五份 ADR：CPA boundary、PostgreSQL source-of-truth、Usage/Ledger billing、routing/scheduler、Web Session authentication；
 - [x] 本状态文件。
 
 ## 3. 已确定的硬决策
@@ -38,6 +38,7 @@
 7. route snapshot 和 price version 按请求固定；scheduler 先硬过滤、再确定性选择、每次写 Decision Log；
 8. 原始 Prompt/响应默认不持久化；subscription 与 official/enterprise/third_party 资源政策分离且默认不商业开放；
 9. P0 单实例、邀请制/预充值或管理员授信；支付 Provider 未完成官方 sandbox/真实 E2E 前为 NO-GO。
+10. Web Session 与推理 API Key 完全分离；生产管理员操作必须 MFA，Session/CSRF 只存 hash，TOTP secret 使用版本化 AES-256-GCM ciphertext。
 
 ## 4. 上游 CPA 核验摘要
 
@@ -53,7 +54,7 @@
 | 2 | `bablo-bootstrap` | 完成 | Go/Vue 骨架、配置、日志、优雅退出、health/ready、Makefile/lockfile、无真实 secret |
 | 3 | `bablo-cpa` | 完成（真实上游 E2E 后置） | pin/checksum、边界 adapter、fake provider non-stream/stream/cancel/error/shutdown/race |
 | 4 | `bablo-data` | 完成 | migration 空库 up/升级/重复启动；核心约束、append-only 防护、repository 事务测试 |
-| 5 | `bablo-auth` | users/sessions schema 已完成 | 登录、Session hash/TTL/注销、CSRF、RBAC、管理员 TOTP/recovery 测试 |
+| 5 | `bablo-auth` | 完成 | Argon2id 登录/rehash、Session hash/TTL/rotation/注销、Origin+CSRF、RBAC、管理员 TOTP/recovery、审计和本地 reset 均有测试 |
 | 6 | `bablo-apikey` | auth/policy 表 | Key 只显示一次/hash；revoked/expired/IP/limit；一 Key 多模型 E2E |
 | 7 | `bablo-models` | data layer | public/upstream model、capability、visibility、price version 管理和缺价拒绝 |
 | 8 | `bablo-credentials` | provider/model policy | AEAD secret/key rotation、状态/health/pool metadata；不泄漏 token |
@@ -86,18 +87,18 @@
 - CPA OAuth/Provider Credential、代理/地区和合法资源政策；
 - 是否首发 self-service payment、支付 Provider、merchant/app 资质、sandbox/真实凭据；
 - 计费币种、最小货币单位、价格表、负余额/退款/赠送/估算 token 业务规则；
-- 管理员 MFA 强制范围、用户邀请/注册、数据 retention/合规和首发协议范围；
+- 管理员 MFA 已固定为生产强制；仍需决定普通用户是否强制 MFA、邀请/自注册策略、邮件或外部 IdP、数据 retention/合规和首发协议范围；
 - 目标用户客户端（是否必须 `/v1/messages`、Gemini 等）。
 
-缺少上述信息不阻塞 `bablo-auth` 的本地实现或数据层回归，但阻塞真实上游/支付 E2E 和最终生产 GO；不得伪造凭据或验证结果。
+缺少上述信息不阻塞 `bablo-apikey` 的本地实现，但阻塞真实上游/支付 E2E、邮件自助恢复和最终生产 GO；不得伪造凭据或验证结果。
 
 ## 7. 下一阶段
 
 ```text
-/bablo-auth
+/bablo-apikey
 ```
 
-数据阶段已完成：下一步实现 users/sessions/RBAC/MFA 认证服务；API Key、模型、Credential 和计费业务仍不得提前混入。
+认证阶段已完成：下一步实现 Bablo 推理 API Key 的一次性明文、hash/prefix、撤销/过期/轮换、IP/限额和 Key -> policy -> 多模型 entitlement；不得把 Key 绑定单一 Group/Provider。
 
 ## 8. Bootstrap 验收与验证证据
 
@@ -123,9 +124,21 @@
 - `go.mod` 精确 pin `github.com/jackc/pgx/v5 v5.10.0` 与 `github.com/pressly/goose/v3 v3.27.3`；Goose v3.27.3 要求 Go 1.25.7，当前项目/CPA Go 基线为 1.26.0，实际环境 Go 1.27.0。
 - `migrations/000001_initial_schema.sql` 覆盖 users/roles/sessions/MFA/API keys/policy/models/providers/credentials/pools/routes/quota/prices/requests/usage/wallet/payment/audit/outbox/stats；所有主键由应用 UUIDv7 提供。
 - `migrations/000002_fact_table_guards.sql` 建立事实表 append-only trigger 和 provider/pool/route target 归属校验；PostgreSQL 错误码断言已纳入集成测试。
-- `migrations/000003_wallet_payment_integrity.sql` 补充币种格式、Usage-Wallet 归属和 payment event processing 状态表；已应用迁移保持不可变。
+- `migrations/000003_wallet_payment_integrity.sql` 补充币种格式、Usage-Wallet 归属和 payment event processing 状态表；`000004_auth_security.sql` 增加 password changed、Session-bound CSRF、MFA verified、TOTP replay 和 factor/recovery 索引；已应用迁移保持不可变。
 - `internal/data.Open` 解析 pgxpool、固定会话 timezone=UTC/application_name=bablo 并执行真实 Ping；`Store.WithTx` 提供提交/回滚边界。
 - `cmd/bablo-migrate` 与 Makefile `migrate`/`migrate-down` 可显式运行 schema 变更；应用启动不自动迁移。
-- `go test -count=1 ./internal/data` 在 `BABLO_TEST_DATABASE_URL` 指向 PostgreSQL 18.4 专用测试库时通过：空 schema up-by-one、连续升级、重复启动、核心唯一约束、append-only、Provider/pool/route target 归属约束和事务 commit/rollback。
-- 实际命令 smoke：迁移版本 `0 -> 1 -> 2 -> 3`，回滚 `3 -> 2`，再恢复到 `3`；Bablo HTTP 启动后 `/readyz` 报告 `postgres=ok`，未初始化 inference 仍保持 503，未伪造整体 ready。
+- `go test -count=1 ./internal/data` 在真实 PostgreSQL 测试库验证空 schema up-by-one、连续升级至 v4、重复启动、核心唯一约束、append-only、Provider/pool/route target 归属约束和事务 commit/rollback。
+- 既有实际命令 smoke 已验证迁移 `0 -> 1 -> 2 -> 3`；本认证阶段通过 PostgreSQL 17-alpine 集成测试验证完整 `0 -> 4`，并实际执行 v4 `down -> up` 恢复。Bablo `/readyz` 在 postgres=ok、inference 未初始化时仍保持 503，未伪造整体 ready。
 - Dockerfile 已同时构建 `bablo` 与嵌入迁移的 `bablo-migrate`；本机 Docker build 未通过，原因是 Docker Hub TLS 证书与 `registry-1.docker.io` 主机名不匹配（`x509`），不是 Go 编译错误，待修复构建环境后重试。
+
+## 11. Auth 验收与验证证据
+
+- `internal/auth` 已实现 Argon2id PHC hash/verify/login rehash、32-byte CSPRNG Session/CSRF token hash、Session rotation/fixation 防护、单个/全部注销和密码变更/重置撤销；
+- `migrations/000004_auth_security.sql` 增加 `password_changed_at`、`csrf_token_hash`、`mfa_verified_at`、`last_totp_counter`、factor 唯一约束和恢复码可用索引；旧无 CSRF Session 在 upgrade 时主动撤销；
+- 所有 mutation 同时校验 `Origin`、CSRF Cookie、`X-CSRF-Token` 和 Session-bound hash；生产配置要求 32-byte base64 MFA key、明确 Web origin、Secure Cookie，并禁止关闭管理员 MFA；
+- TOTP secret 使用 AES-256-GCM + factor/user/key-version AAD；绑定二次确认、TOTP counter 防重放、10 个 80-bit hash 恢复码和单次消费在 PostgreSQL 行锁事务内；
+- `bablo auth create-admin` 与 `bablo auth reset-password` 已实际运行；密码从终端/stdin 读取，reset 实际撤销全部 Session，浏览器验证旧密码被拒绝、新密码可登录；
+- 真实 PostgreSQL 17-alpine：`BABLO_TEST_DATABASE_URL=... go test ./internal/data ./internal/auth -count=1` 通过，覆盖迁移 v4、Session fixation、CSRF、password change/logout、admin MFA、recovery replay 和 RBAC；
+- 完整验证：真实 PostgreSQL 下 `go test -count=1 ./...`、`go test -race -count=1 ./internal/auth`、`go vet ./...`、`go build -trimpath ./cmd/bablo` 全部通过；前端 `pnpm lint`、3 tests、typecheck/Vite build 全部通过；Compose 带示例变量 `config --quiet` 通过；
+- 浏览器实际访问 Vue 登录页，经 Vite proxy 完成登录、路由守卫进入 Dashboard、HttpOnly Session/Path `/api/v1`、CSRF/Path `/` 和退出清理验证；开发环境 Cookie 非 Secure，生产强制 Secure 由配置测试覆盖；
+- 当前限制：没有邮件/IdP 自助恢复；TOTP 只读取一个活动 key version，多版本解密/re-encrypt 是生产 key rotation blocker；登录/MFA limiter 为 P0 单实例内存实现，HA 前必须接入 Redis 协调；管理员 MFA enrollment 管理 UI 未实现，但 API 与服务端强制已完成。

@@ -2,7 +2,7 @@
 
 > 目标：生产级多用户 AI Gateway 的控制面、推理面和账务安全基线
 > 日期：2026-08-29
-> 当前状态：设计已确定，代码尚未实现
+> 当前状态：P0 Web Session、CSRF、RBAC、管理员 TOTP/恢复码已实现；推理 Key、Credential 和支付安全仍按后续阶段落地
 
 ## 1. 资产与信任边界
 
@@ -21,16 +21,17 @@
 
 ## 2. 身份认证与授权
 
-### Web 管理面
+### Web 管理面（P0 已实现）
 
-- 登录使用 Argon2id，参数和版本写入 `password_params_version`，参数升级采用登录时 rehash；
-- Session 使用 CSPRNG 高熵 token，数据库只存 hash；Cookie `HttpOnly`、生产 `Secure`、合理 `SameSite`、有限 TTL，支持单个/全部注销；
-- 登录、MFA、密码变更和危险管理操作使用 request rate limit；失败锁定需有上限、恢复和管理员审计，不能造成永久 DoS；
-- 管理员至少 TOTP MFA，绑定必须二次确认，恢复码 hash 化、单次使用、行锁/条件更新防重放；生产策略可强制全体管理员 MFA；
-- 状态变更使用 CSRF token（SameSite 不是唯一防线）；CORS 只允许显式 origin；
-- RBAC 至少 admin/user。UI 隐藏不是授权；每个 service/use-case 重新判断 actor、tenant/user scope、资源状态和危险操作权限。
-
-没有可靠邮件基础设施时，不实现伪造的邮件重置；采用受审计的管理员重置或一次性恢复流程，并在发布清单标明限制。
+- 密码使用 Argon2id PHC 格式；当前参数版本 `argon2id-v1-m19456-t2-p1` 对应 19 MiB、2 iterations、1 lane、16-byte salt、32-byte key。`users.password_params_version` 记录策略版本，成功登录时按当前参数自动 rehash；密码长度为 12–1024 UTF-8 bytes；
+- Session token 与 CSRF token 各由 CSPRNG 生成 32 bytes。浏览器只收到一次明文；PostgreSQL 只存 SHA-256 hash。Session 默认 TTL 12h，可配置范围 5m–7d；登录、MFA 成功均旋转 Session，密码变更/重置和 logout-all 撤销全部 Session；
+- `bablo_session` Cookie 为 `HttpOnly`、`SameSite=Lax`、Path `/api/v1`，生产环境强制 `Secure`；`bablo_csrf` 为前端可读、Path `/`、同样有限 TTL。所有状态变更同时校验显式 `Origin`、CSRF Cookie、`X-CSRF-Token` 和 Session 内绑定 hash，SameSite 不是唯一防线；
+- 登录和 MFA 使用有界单实例 fixed-window limiter：默认每个 email + source IP 5 分钟 8 次，窗口到期自动恢复，不写永久账号锁。P0 单实例可用；HA 前必须替换/补充 Redis 协调实现，仍不得把 Redis 当身份事实源；
+- RBAC 至少 `admin`/`user`。授权在 auth service 内重新判断，不依赖 UI。生产 `BABLO_AUTH_REQUIRE_ADMIN_MFA` 不能关闭；管理员操作要求 admin role 且当前 Session 已完成 MFA。未绑定 MFA 的管理员只允许登录和进入绑定流程，不能执行管理员密码重置；
+- TOTP 使用 30 秒、6 digits、HMAC-SHA1 兼容配置，允许 ±1 period，`last_totp_counter` 在行锁事务内前进以拒绝重放。绑定先写 pending factor，再用有效 TOTP 二次确认；成功后原子生成并 hash 存储 10 个 80-bit 恢复码、旋转 Session；恢复码通过条件 UPDATE 单次消费；
+- TOTP secret 使用 AES-256-GCM，主密钥由 `BABLO_AUTH_ENCRYPTION_KEY` 以 32-byte base64 注入，ciphertext/nonce/key_version 写 PostgreSQL，AEAD AAD 绑定 factor ID、user ID 和 key version。当前只读取活动 key version；多版本解密和后台 re-encrypt 属于 credentials/security 阶段上线阻塞；
+- `bablo auth create-admin --email ...` 与 `bablo auth reset-password --email ...` 是本地可信运维入口，密码从无回显终端或 stdin 读取，不进入 argv；重置在单事务内更新 hash、撤销全部 Session、写 audit。没有可靠邮件基础设施时不伪造邮件重置；
+- 登录成功/失败、MFA 开始/启用/验证/恢复码重建、密码变更/重置和注销写 `audit_logs`；不记录密码、TOTP secret、恢复码、Cookie 或请求正文。
 
 ### 推理面
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { ApiError, api } from '../lib/api'
@@ -7,14 +7,33 @@ import { ApiError, api } from '../lib/api'
 const router = useRouter()
 const email = ref('')
 const password = ref('')
+const mfaCode = ref('')
+const mfaRequired = ref(false)
 const errorMessage = ref('')
 const submitting = ref(false)
+
+type SessionResponse = {
+  session: { mfa_required: boolean }
+}
 
 async function submit() {
   errorMessage.value = ''
   submitting.value = true
   try {
-    await api.post('/api/v1/auth/login', { email: email.value, password: password.value })
+    if (mfaRequired.value) {
+      await api.post<SessionResponse>('/api/v1/auth/mfa/verify', { code: mfaCode.value })
+      await router.push('/')
+      return
+    }
+    const response = await api.post<SessionResponse>('/api/v1/auth/login', {
+      email: email.value,
+      password: password.value,
+    })
+    password.value = ''
+    if (response.session.mfa_required) {
+      mfaRequired.value = true
+      return
+    }
     await router.push('/')
   } catch (error) {
     errorMessage.value = error instanceof ApiError
@@ -24,6 +43,19 @@ async function submit() {
     submitting.value = false
   }
 }
+
+onMounted(async () => {
+  try {
+    const response = await api.get<SessionResponse>('/api/v1/auth/session')
+    if (response.session.mfa_required) {
+      mfaRequired.value = true
+      return
+    }
+    await router.push('/')
+  } catch {
+    // No active session: remain on the login form.
+  }
+})
 </script>
 
 <template>
@@ -36,27 +68,38 @@ async function submit() {
         Bablo · AI Gateway
       </div>
       <h1 id="login-title">
-        登录控制台
+        {{ mfaRequired ? '完成多因素认证' : '登录控制台' }}
       </h1>
       <p class="muted">
         管理 API Key、模型访问权限、Usage 与钱包。
       </p>
       <form @submit.prevent="submit">
-        <label>
-          邮箱
+        <template v-if="!mfaRequired">
+          <label>
+            邮箱
+            <input
+              v-model="email"
+              type="email"
+              autocomplete="username"
+              required
+            >
+          </label>
+          <label>
+            密码
+            <input
+              v-model="password"
+              type="password"
+              autocomplete="current-password"
+              required
+            >
+          </label>
+        </template>
+        <label v-else>
+          TOTP 或恢复码
           <input
-            v-model="email"
-            type="email"
-            autocomplete="username"
-            required
-          >
-        </label>
-        <label>
-          密码
-          <input
-            v-model="password"
-            type="password"
-            autocomplete="current-password"
+            v-model="mfaCode"
+            type="text"
+            autocomplete="one-time-code"
             required
           >
         </label>
@@ -72,11 +115,11 @@ async function submit() {
           type="submit"
           :disabled="submitting"
         >
-          {{ submitting ? '登录中…' : '登录' }}
+          {{ submitting ? '提交中…' : (mfaRequired ? '验证' : '登录') }}
         </button>
       </form>
       <p class="hint">
-        认证接口将在 auth 阶段接入；当前页面用于验证前端 shell 和错误处理。
+        Session、CSRF 与管理员 MFA 已由 Bablo 服务端校验。
       </p>
     </section>
   </main>

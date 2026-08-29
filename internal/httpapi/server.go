@@ -20,10 +20,21 @@ type Server struct {
 	httpServer   *http.Server
 	requestCount atomic.Uint64
 	readiness    *Readiness
+	authHandler  http.Handler
+}
+
+// Option configures optional domain HTTP surfaces.
+type Option func(*Server)
+
+// WithAuthHandler mounts the Web Session authentication surface.
+func WithAuthHandler(handler http.Handler) Option {
+	return func(server *Server) {
+		server.authHandler = handler
+	}
 }
 
 // New constructs the bootstrap server without opening a listener.
-func New(cfg config.Config, logger *slog.Logger, version string) *Server {
+func New(cfg config.Config, logger *slog.Logger, version string, options ...Option) *Server {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -33,6 +44,11 @@ func New(cfg config.Config, logger *slog.Logger, version string) *Server {
 		logger:    logger,
 		version:   version,
 		readiness: NewReadiness(cfg),
+	}
+	for _, option := range options {
+		if option != nil {
+			option(server)
+		}
 	}
 	server.httpServer = &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -74,6 +90,22 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/readyz", s.readyz)
 	mux.HandleFunc("/metrics", s.metrics)
+	authHandler := s.authHandler
+	if authHandler == nil {
+		authHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "no-store")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error": map[string]string{
+					"type":       "authentication_error",
+					"code":       "auth_unavailable",
+					"message":    "认证服务尚未配置。",
+					"request_id": RequestID(r.Context()),
+				},
+			})
+		})
+	}
+	mux.Handle("/api/v1/auth/", authHandler)
+	mux.Handle("/api/v1/admin/users/", authHandler)
 	mux.HandleFunc("/", s.notFound)
 	return withRequestID(mux, s.logger, &s.requestCount)
 }

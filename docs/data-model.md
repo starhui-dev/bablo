@@ -1,6 +1,6 @@
 # Bablo 数据模型规划
 
-> 已由 `migrations/000001_initial_schema.sql`、`migrations/000002_fact_table_guards.sql` 与 `migrations/000003_wallet_payment_integrity.sql` 落地；后续迁移必须新增版本文件，不得重写已应用文件。
+> 已由 `migrations/000001_initial_schema.sql`、`000002_fact_table_guards.sql`、`000003_wallet_payment_integrity.sql` 与 `000004_auth_security.sql` 落地；后续迁移必须新增版本文件，不得重写已应用文件。
 > 日期：2026-08-29
 > 事实来源：PostgreSQL；Redis 只存可重建状态
 
@@ -54,10 +54,10 @@ erDiagram
 
 ### Identity / policy
 
-- `users`：`id`, `email_normalized`, `password_hash`, `password_params_version`, `status`, `created_at`, `updated_at`；
+- `users`：`id`, `email_normalized`, `password_hash`, `password_params_version`, `password_changed_at`, `status`, `created_at`, `updated_at`；当前密码 hash 为 Argon2id PHC，参数策略单独版本化；
 - `roles`、`user_roles`：至少 `admin`、`user`；角色变更写 audit；
-- `user_sessions`：`id`, `user_id`, `token_hash`, `expires_at`, `revoked_at`, `last_seen_at`, device metadata；数据库不存明文 session token；
-- `mfa_factors`：`user_id`, factor type, encrypted secret metadata, enabled, confirmed_at；恢复码只存 hash 和使用标志；
+- `user_sessions`：`id`, `user_id`, unique `token_hash`, `csrf_token_hash`, `expires_at`, `revoked_at`, `mfa_verified_at`, `last_seen_at`, device metadata；数据库不存明文 Session/CSRF token；
+- `mfa_factors`：每个 `(user_id, factor_type)` 唯一；TOTP 保存 AEAD ciphertext/nonce/key_version、enabled/confirmed、`last_totp_counter`；恢复码只存 hash 和 `consumed_at`，条件 UPDATE 单次消费；
 - `api_keys`：`id`, `user_id`, `name`, `prefix`, `secret_hash`, `status`, `expires_at`, IP policy, RPM/TPM/daily/monthly budget, `last_used_at`；没有 `group_id`/单一 `provider_id`；
 - `policies`、`api_key_policies`、`policy_model_entitlements`：表达 Key -> policy -> 多模型 entitlement；deny 优先级和默认拒绝策略在 service 层固定并测试。
 
@@ -103,8 +103,8 @@ erDiagram
 | 对象 | 必须唯一/幂等 |
 |---|---|
 | user | `lower(email_normalized)` |
-| session | `token_hash`；撤销不删除历史 |
-| MFA recovery | `(factor_id, recovery_code_hash)`，单次消费需行锁/条件更新 |
+| session | `token_hash`；有效 Session 同时必须有 `csrf_token_hash`，撤销不删除历史 |
+| MFA | `(user_id, factor_type)`；recovery `(factor_id, code_hash)`，TOTP counter/恢复码消费在行锁事务内防重放 |
 | API Key | `secret_hash`；prefix 仅展示索引，不代替 hash |
 | entitlement | `(policy_id, model_id)` |
 | provider/model | `(provider_id, upstream_model_id)` |
@@ -144,6 +144,7 @@ Raw Usage、scheduler/audit、payment payload hash 和 rollup 的 retention 必�
 - `migrations/000001_initial_schema.sql` 创建本规划列出的身份、授权、模型、Provider、Credential、Route、Quota、Price、Request、Usage、Wallet、Payment、Audit、Outbox 和 Stats 核心表。
 - `migrations/000002_fact_table_guards.sql` 为 Usage、reconciliation、Wallet Ledger、Payment Event、Scheduler Decision 和 Audit 建立数据库级 append-only 防护，并校验 pool/credential 与 route target/provider 的归属一致性。
 - `migrations/000003_wallet_payment_integrity.sql` 补充 ISO 4217 大写币种格式、Usage 到 Wallet 的归属列和 payment event processing 状态表；已应用迁移保持不可变。
+- `migrations/000004_auth_security.sql` 增加 `password_changed_at`、Session-bound CSRF hash、MFA verified timestamp、TOTP replay counter、factor/recovery 唯一与可用索引；迁移时主动撤销无法绑定 CSRF 的旧 Session。
 - `internal/data` 使用 pgx/v5 连接池；repository 通过 `Querier` 依赖注入，`Store.WithTx` 是唯一事务边界，handler 不直接拼 SQL。
 - `cmd/bablo-migrate` 是显式迁移入口，默认 up；`BABLO_MIGRATION_ACTION=down` 只回滚最新版本。应用启动不自动改 schema。
 - 主键不设置数据库生成默认值，由应用调用 `internal/id.New` 生成 UUIDv7；数据库时间列统一 `timestamptz`，连接会话固定 UTC。

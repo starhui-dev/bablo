@@ -1,5 +1,25 @@
 <script setup lang="ts">
-import { RouterLink } from 'vue-router'
+import { ref } from 'vue'
+import { RouterLink, useRouter } from 'vue-router'
+
+import { ApiError, api } from '../lib/api'
+
+const router = useRouter()
+const signingOut = ref(false)
+
+async function logout() {
+  signingOut.value = true
+  try {
+    await api.post('/api/v1/auth/logout', {})
+    await router.push('/login')
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) {
+      await router.push('/login')
+    }
+  } finally {
+    signingOut.value = false
+  }
+}
 </script>
 
 <template>
@@ -19,9 +39,14 @@ import { RouterLink } from 'vue-router'
         <RouterLink to="/">
           Dashboard
         </RouterLink>
-        <RouterLink to="/login">
-          登录
-        </RouterLink>
+        <button
+          class="nav-button"
+          type="button"
+          :disabled="signingOut"
+          @click="logout"
+        >
+          {{ signingOut ? '退出中…' : '退出登录' }}
+        </button>
       </nav>
     </header>
     <main class="page-content">

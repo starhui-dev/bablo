@@ -82,3 +82,18 @@ func TestUnknownPathReturnsJSONNotFound(t *testing.T) {
 		t.Fatalf("body = %q, want not_found", recorder.Body.String())
 	}
 }
+
+func TestAuthSurfaceFailsClosedWhenUnavailable(t *testing.T) {
+	server := testServer()
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"email":"user@example.test","password":"not-used"}`))
+
+	server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if !strings.Contains(recorder.Body.String(), `"code":"auth_unavailable"`) || !strings.Contains(recorder.Body.String(), `"request_id":"req_`) {
+		t.Fatalf("body = %q, want stable auth_unavailable envelope", recorder.Body.String())
+	}
+}

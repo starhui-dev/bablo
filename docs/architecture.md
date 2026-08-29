@@ -2,7 +2,7 @@
 
 > 版本：架构规划基线
 > 日期：2026-08-29
-> 相关 ADR：`docs/adr/0001-cpa-sdk-boundary.md`、`docs/adr/0002-postgres-source-of-truth.md`、`docs/adr/0003-usage-ledger-billing.md`、`docs/adr/0004-model-routing-and-scheduler.md`
+> 相关 ADR：`docs/adr/0001-cpa-sdk-boundary.md`、`docs/adr/0002-postgres-source-of-truth.md`、`docs/adr/0003-usage-ledger-billing.md`、`docs/adr/0004-model-routing-and-scheduler.md`、`docs/adr/0005-web-session-authentication.md`
 
 ## 1. 架构结论
 
@@ -53,7 +53,7 @@ Bablo InferenceEngine adapter]
 | 模块 | 负责 | 输入/输出 | 明确禁止 |
 |---|---|---|---|
 | `user` | 用户生命周期、状态、角色关系 | user ID、profile、role | 推理 Key 校验、账本 SQL |
-| `auth` | 登录、Session、密码、MFA、RBAC/CSRF policy | session principal、authorization decision | 把 Web Session 当推理 API Key |
+| `auth` | `internal/auth` 已实现登录、Argon2id、Session、密码、TOTP/recovery、RBAC/CSRF；`bablo auth` 提供本地管理员维护 | session principal、authorization decision、一次性 Cookie/MFA enrollment material | 把 Web Session 当推理 API Key、在 handler 绕过 service 授权 |
 | `apikey` | Key 生成/hash、撤销、过期、轮换、限额 | key principal、policy ID | 保存明文 Key、绑定单一 group/provider |
 | `model` | public model、能力、visibility、billing class | model capability、provider model | 散落模型字符串、直接覆盖人工目录 |
 | `provider` | Provider 元数据、资源政策 | provider ID、resource type | 处理 OAuth secret 明文 |
@@ -67,6 +67,13 @@ Bablo InferenceEngine adapter]
 | `stats` | 从 Usage/Ledger 的查询和 rollup | filters、aggregates | 自建另一套计费公式 |
 | `audit` | 管理员/敏感动作不可变记录 | actor/action/target/result | 记录 secret、Prompt/响应正文 |
 | `inference/cpa` | CPA SDK lifecycle、请求/流、错误和 capability 映射 | Bablo `InferenceEngine` 类型 | 向业务泄漏 CPA 类型或 import CPA `internal/*` |
+
+
+### Auth 已实现调用边界
+
+`internal/auth.Handler -> auth.Service -> auth.Repository -> internal/data.Store`。Handler 只负责 JSON、Cookie、Origin/CSRF 传输校验和稳定错误；密码验证、Session rotation、管理员 MFA 与角色判断在 Service；所有身份事实、Session 撤销、MFA counter/recovery code 消费和 audit 在 PostgreSQL 事务内完成。前端只消费 Bablo Session DTO，不接触 hash、MFA ciphertext 或数据库类型。
+
+P0 登录/MFA limiter 是有容量上限和自动过期的进程内状态，符合单实例首发边界；HA 前必须迁移为 Redis 协调实现。PostgreSQL 仍是用户、角色、Session 撤销、MFA 和 audit 的唯一事实源，Redis 丢失不能恢复权限或 Session。
 
 ## 4. 稳定领域接口
 

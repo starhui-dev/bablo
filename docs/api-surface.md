@@ -30,18 +30,42 @@
 
 ## 3. P0 管理面
 
-### Session / identity
+### Session / identity（已实现）
 
-- `POST /api/v1/auth/login`
-- `POST /api/v1/auth/logout`
-- `POST /api/v1/auth/logout-all`
-- `GET /api/v1/auth/session`
-- `POST /api/v1/auth/password`
-- `POST /api/v1/auth/mfa/totp/bind`
-- `POST /api/v1/auth/mfa/totp/confirm`
-- `POST /api/v1/auth/mfa/recovery/regenerate`
+| 方法 | 路径 | Session 要求 | 说明 |
+|---|---|---|---|
+| POST | `/api/v1/auth/login` | 无；要求可信 `Origin` | email/password 登录；成功设置 Session/CSRF Cookie；已绑定 MFA 时返回 `mfa_required=true` 的 partial Session |
+| GET | `/api/v1/auth/session` | 有效 Session | 返回 user ID、email、roles、expiry、MFA enabled/required，不返回 token |
+| POST | `/api/v1/auth/mfa/verify` | partial Session + CSRF | 接受 6 位 TOTP 或单次恢复码；成功旋转为 MFA-verified Session |
+| POST | `/api/v1/auth/logout` | 任意有效 Session + CSRF | 撤销当前 Session 并清理 Cookie |
+| POST | `/api/v1/auth/logout-all` | full Session + CSRF | 撤销当前用户全部 Session |
+| POST | `/api/v1/auth/password` | full Session + CSRF | 校验当前密码，更新 Argon2id hash，撤销全部 Session |
+| POST | `/api/v1/auth/mfa/totp/bind` | full、尚未启用 MFA 的 Session + CSRF | 返回一次性 `secret` 与 `provisioning_url`，数据库仅保存 AEAD ciphertext |
+| POST | `/api/v1/auth/mfa/totp/confirm` | pending factor 的 full Session + CSRF | 二次 TOTP 确认、启用 factor、返回一次性恢复码并旋转 Session |
+| POST | `/api/v1/auth/mfa/recovery/regenerate` | MFA-verified Session + CSRF | 原子作废旧恢复码并返回新码一次 |
+| POST | `/api/v1/admin/users/{user_id}/password` | admin + MFA-verified Session + CSRF | 管理员重置密码并撤销目标用户全部 Session |
 
-登录限速、Session fixation 防护、有限 TTL、Secure/HttpOnly/SameSite Cookie、CSRF token 由 auth 模块统一处理。没有邮件基础设施时不伪造密码重置邮件流程。
+登录请求示例：
+
+```json
+{
+  "email": "user@example.com",
+  "password": "user-supplied password"
+}
+```
+
+成功响应中的 `session` 只含公开身份状态；Session/CSRF 明文仅在 Cookie 中。`bablo_session` 为 `HttpOnly`、生产 `Secure`、Path `/api/v1`；`bablo_csrf` Path `/`，前端在状态变更时复制到 `X-CSRF-Token`。所有 mutation 还要求 `Origin` 精确匹配 `BABLO_WEB_ORIGIN`。请求正文上限 32 KiB，未知 JSON 字段被拒绝。
+
+认证错误使用 `authentication_error` + 稳定 code：`invalid_credentials`、`invalid_session`、`csrf_failed`、`mfa_required`、`invalid_mfa_code`、`permission_denied`、`rate_limited`、`conflict`。限速响应为 429 并带 `Retry-After`。
+
+没有邮件基础设施时不提供伪造的邮件重置 API。可信本机运维使用：
+
+```text
+bablo auth create-admin --email user@example.com
+bablo auth reset-password --email user@example.com
+```
+
+密码从无回显终端或 stdin 读取，不进入命令行参数；操作更新 audit，密码重置撤销全部 Session。
 
 ### 用户 API Key / policy
 

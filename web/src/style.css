@@ -19,6 +19,9 @@ button, input { font: inherit; }
 nav { display: flex; gap: 18px; }
 nav a { color: #94a3b8; font-size: 14px; }
 nav a.router-link-active { color: #e0f2fe; }
+.nav-button { background: transparent; border: 0; color: #94a3b8; cursor: pointer; font-size: 14px; padding: 0; }
+.nav-button:hover { color: #e0f2fe; }
+.nav-button:disabled { cursor: wait; opacity: .6; }
 .page-content { margin: 0 auto; max-width: 1120px; padding: 56px 24px; }
 .hero { align-items: flex-start; display: flex; justify-content: space-between; gap: 24px; }
 .eyebrow { color: #38bdf8; font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }

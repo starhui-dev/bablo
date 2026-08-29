@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/starhui-dev/bablo/internal/auth"
 	"github.com/starhui-dev/bablo/internal/config"
 	"github.com/starhui-dev/bablo/internal/data"
 	"github.com/starhui-dev/bablo/internal/httpapi"
@@ -17,29 +18,84 @@ import (
 var buildVersion = "dev"
 
 func main() {
-	os.Exit(run())
+	os.Exit(run(os.Args[1:]))
 }
 
-func run() int {
+func run(arguments []string) int {
+	if len(arguments) > 0 {
+		if arguments[0] == "auth" {
+			return runAuthCommand(arguments[1:])
+		}
+		logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+		logger.Error("bablo_command_error", "error", "unknown command", "command", arguments[0])
+		return 2
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 		logger.Error("bablo_config_error", "error", err)
 		return 1
 	}
+	authCfg, err := config.LoadAuth(cfg.Environment)
+	if err != nil {
+		logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+		logger.Error("bablo_auth_config_error", "error", err)
+		return 1
+	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
-	server := httpapi.New(cfg, logger, buildVersion)
-
+	var store *data.Store
+	var serverOptions []httpapi.Option
 	if cfg.DatabaseURL != "" {
 		connectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		store, err := data.Open(connectCtx, data.Config{URL: cfg.DatabaseURL})
+		store, err = data.Open(connectCtx, data.Config{URL: cfg.DatabaseURL})
 		cancel()
 		if err != nil {
 			logger.Error("bablo_database_error", "error", err)
 			return 1
 		}
 		defer store.Close()
+
+		if len(authCfg.EncryptionKey) > 0 {
+			secretBox, err := auth.NewSecretBox(authCfg.EncryptionKey, authCfg.KeyVersion)
+			if err != nil {
+				logger.Error("bablo_auth_secretbox_error", "error", err)
+				return 1
+			}
+			repository, err := auth.NewRepository(store)
+			if err != nil {
+				logger.Error("bablo_auth_repository_error", "error", err)
+				return 1
+			}
+			service, err := auth.NewService(repository, auth.ServiceConfig{
+				SessionTTL:      authCfg.SessionTTL,
+				Issuer:          authCfg.Issuer,
+				RequireAdminMFA: authCfg.RequireAdminMFA,
+				SecretBox:       secretBox,
+			})
+			if err != nil {
+				logger.Error("bablo_auth_service_error", "error", err)
+				return 1
+			}
+			handler, err := auth.NewHandler(service, logger, auth.HandlerConfig{
+				AllowedOrigin: authCfg.AllowedOrigin,
+				CookieDomain:  authCfg.CookieDomain,
+				CookieSecure:  authCfg.CookieSecure,
+				SessionTTL:    authCfg.SessionTTL,
+			})
+			if err != nil {
+				logger.Error("bablo_auth_handler_error", "error", err)
+				return 1
+			}
+			serverOptions = append(serverOptions, httpapi.WithAuthHandler(handler))
+		}
+	} else if len(authCfg.EncryptionKey) > 0 {
+		logger.Error("bablo_auth_database_error", "error", "BABLO_DATABASE_URL is required when authentication is configured")
+		return 1
+	}
+
+	server := httpapi.New(cfg, logger, buildVersion, serverOptions...)
+	if store != nil {
 		server.SetDependencyReady("postgres", true)
 	}
 
