@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+
+/bin/
+/dist/
+/web/dist/
+/web/node_modules/
+coverage/
+*.test
+*.out
+.DS_Store

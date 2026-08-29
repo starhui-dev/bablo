@@ -1,20 +1,20 @@
 # Bablo 实施状态
 
 > 最后更新：2026-08-29
-> 本次工作：架构规划与上游核验；未创建业务表，未实现服务代码
+> 本次工作：完成 bootstrap 工程骨架、基础 HTTP 服务和前端控制台壳；业务表与 CPA adapter 尚未实现
 
 ## 1. 仓库审计结果
 
 | 项目 | 观察结果 | 证据/影响 |
 |---|---|---|
-| 根目录 | 只有 `.omp/` 提示词、命令、代理、技能 | `read .`、文件盘点 |
-| 后端 | 未发现 `go.mod`、`cmd/`、`internal/`、Go 源码或测试 | 需要从 bootstrap 开始 |
-| 前端 | 未发现 `package.json`、Vue/TS/Vite 或 pnpm lockfile | 需要从 bootstrap 开始 |
-| 数据库 | 未发现 migrations/SQL/schema | 本次只设计，不建业务表 |
-| CI/部署 | 未发现 workflow、Dockerfile、Compose、Makefile | 需要后续阶段补齐 |
-| 文档 | 原先没有 `docs/`；本次创建规划文档和 ADR | 不覆盖已有有效文档 |
-| Git | 工作目录不是 Git 仓库；`git status --short --branch` 失败 | 无法核对 tracked/unstaged diff；不能据此声称工作区 clean |
-| CPA 本地使用 | 未发现本地 Go import 或锁定版本 | 仅完成官方上游核验，Bablo adapter 尚未实现 |
+| 根目录 | `.omp/`、`docs/`、Go/Vue bootstrap 文件 | 保留既有提示词与规划文档，新增实现文件 |
+| 后端 | 已建立 `go.mod`、`cmd/bablo/`、`internal/config`、`internal/httpapi`、`internal/inference` 和空 CPA 边界 | module 为 `github.com/starhui-dev/bablo`，CPA 依赖留到 `bablo-cpa` |
+| 前端 | 已建立 Vue 3 + TypeScript + Vite + pnpm shell、路由、API client、登录/Dashboard/404 页面 | `web/package.json`、`web/pnpm-lock.yaml` |
+| 数据库 | 未创建业务表；`migrations/.gitkeep` 只保留目录 | 数据模型仍以 `bablo-data` 实现 |
+| CI/部署 | 已有 `Dockerfile`、`deploy/compose.dev.yaml`；尚无 CI workflow/生产部署 runbook | Compose 仅作为开发基础设施，生产硬化留到后续阶段 |
+| 文档 | 架构规划、ADR、README、LICENSE 均已存在 | 不覆盖已有有效文档 |
+| Git | 已关联 `origin` 到 `git@github.com:starhui-dev/bablo.git` | bootstrap 修改尚未提交 |
+| CPA 本地使用 | 仅有 `internal/inference/cpa` 空边界，未 import CPA SDK | 下一阶段锁定并验证 `v7.2.145` |
 
 ## 2. 已落盘的规划
 
@@ -80,8 +80,8 @@
 
 ### 必须由环境/业务提供
 
-- Git remote/最终 Go module path；当前不是 Git 仓库，bootstrap 不得猜组织名；
-- Go 1.26.0/toolchain 与依赖下载环境；
+- Go module 已从 GitHub remote 确定为 `github.com/starhui-dev/bablo`；CPA tag 仍需在 `bablo-cpa` 编译验证；
+- 当前本机为 Go 1.27.0，满足已核验 CPA `go 1.26.0` 的向后兼容方向，但尚未完成 CPA 实际编译契约；
 - PostgreSQL、Redis、TLS/域名、镜像 registry 和 secret manager；
 - CPA OAuth/Provider Credential、代理/地区和合法资源政策；
 - 是否首发 self-service payment、支付 Provider、merchant/app 资质、sandbox/真实凭据；
@@ -89,21 +89,22 @@
 - 管理员 MFA 强制范围、用户邀请/注册、数据 retention/合规和首发协议范围；
 - 目标用户客户端（是否必须 `/v1/messages`、Gemini 等）。
 
-缺少上述信息不阻塞文档规划，但阻塞对应真实 E2E 或生产 GO；不得伪造凭据或验证结果。
+缺少上述信息不阻塞当前 bootstrap 或使用 fake provider 的 CPA 兼容测试，但阻塞真实上游/支付 E2E 和最终生产 GO；不得伪造凭据或验证结果。
 
-## 7. 推荐下一条命令
+## 7. 下一阶段
 
 ```text
-/bablo-bootstrap
+/bablo-cpa
 ```
 
-执行前只需补齐/确认 Go 1.26 toolchain 和最终 module path；该阶段应增量创建项目骨架，不创建本文设计之外的业务表，也不得覆盖 `.omp/` 或未来用户代码。
+bootstrap 已完成；下一阶段只聚焦锁定 CPA v7.2.145、建立 adapter 生命周期和兼容测试。真实 OAuth/Provider Credential 不是 fake provider 兼容测试的前置条件，但真实上游 E2E 仍需外部凭据。
 
-## 8. 本次规划验证
+## 8. Bootstrap 验收与验证证据
 
-- `read .` 与文件盘点确认初始目录只有 `.omp/`；本次未覆盖已有源码或业务文档；
-- `git status --short --branch` 已执行并返回“不是 Git 仓库”，因此没有把当前目录误报为 clean；
-- `test -f` 覆盖全部 11 个要求文件并通过；`wc -l` 共 961 行；
-- `glob` 确认 `migrations/**`、`*.go`、`**/package.json`、`.github/**` 在本次仍不存在，未创建业务表或实现代码；
-- 跨文档搜索核对 `v7.2.145`、Go 1.26.0、CPA boundary、PostgreSQL source-of-truth、UsageEvent/Ledger、Key 多模型和 P0/NO-GO 语义一致；`/v6` 只出现在上游漂移审计表中；
-- 本阶段没有可运行的编译、单测、race、E2E、迁移或生产 restore 验证；这些是后续对应阶段的验收条件，不能提前宣称通过。
+- `go test ./...` 通过；`go vet ./...` 通过；`go build -trimpath -o bin/bablo ./cmd/bablo` 通过；
+- `pnpm install` 完成锁文件生成；首次安装的 esbuild 脚本按 pnpm 11 审批后重建成功；
+- `pnpm lint`、`pnpm typecheck`、`pnpm test`（2 tests）、`pnpm build` 全部通过；
+- 后端实际启动 smoke：`/healthz` 返回 200；`/readyz` 在 DB/Redis/Inference 未初始化时返回 503 和明确 checks；`/metrics` 返回 Prometheus 文本；
+- 前端实际浏览器 smoke 验证 Dashboard、`/login` 和未知路径 404，页面标题、导航、空状态和错误页面可见；
+- `git diff --check` 通过；文件未进入提交前仍有 bootstrap 未提交变更；
+- 未创建业务表、真实 secret 或 CPA SDK 依赖；下一阶段以 compatibility suite 取代空边界。

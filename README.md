@@ -2,7 +2,7 @@
 
 Bablo 是面向多用户、多 API Key、多模型的生产级 AI Gateway：自研控制面，使用隔离的 CPA SDK adapter 作为 inference engine。
 
-> 当前仓库处于架构规划阶段。现阶段已落盘产品范围、系统架构、数据模型、API、安全模型、CPA 兼容性和实施状态文档，业务代码尚未开始实现。
+> 当前已完成架构规划与 bootstrap 工程骨架：Go HTTP 服务、Vue 控制台壳、开发配置和健康检查已落盘；业务表与 CPA adapter 尚未实现。
 
 ## 已确定的架构边界
 
@@ -40,9 +40,9 @@ github.com/router-for-me/CLIProxyAPI/v7 v7.2.145
 
 ## 实施顺序
 
-项目按 `docs/implementation-status.md` 中的阶段顺序推进：先建立 Go/Vue 工程骨架和 CPA adapter，再实现数据层、认证、Key、多模型路由、调度、推理数据面、Usage/账务，最后完成可观测性、安全、测试、压测、部署、CI 和上线门禁。
+项目按 `docs/implementation-status.md` 中的阶段顺序推进：bootstrap 已完成，下一步建立 CPA adapter 和兼容测试，再实现数据层、认证、Key、多模型路由、调度、推理数据面、Usage/账务，最后完成可观测性、安全、测试、压测、部署、CI 和上线门禁。
 
-下一阶段：`/bablo-bootstrap`。
+下一阶段：`/bablo-cpa`。
 
 ## 安全与上线
 
