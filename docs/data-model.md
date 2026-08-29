@@ -1,6 +1,6 @@
 # Bablo 数据模型规划
 
-> 仅设计，不创建业务表
+> 已由 `migrations/000001_initial_schema.sql`、`migrations/000002_fact_table_guards.sql` 与 `migrations/000003_wallet_payment_integrity.sql` 落地；后续迁移必须新增版本文件，不得重写已应用文件。
 > 日期：2026-08-29
 > 事实来源：PostgreSQL；Redis 只存可重建状态
 
@@ -137,4 +137,13 @@ erDiagram
 
 首批索引围绕真实查询：`user_id + created_at`、`api_key_id + created_at`、`public/resolved_model + created_at`、`provider_id/credential_id + created_at`、`request_id`、`order_no`、`status + created_at`、`observed_at`。高增长表按时间范围评估分区，但没有基准数据前不预先复杂分区。
 
-Raw Usage、scheduler/audit、payment payload hash 和 rollup 的 retention 必须配置化并区分合规需要；账本与财务证据不得因 dashboard retention 被删除。所有结构变更走 SQL-first migration，要求空库 up、连续升级、重复启动安全和约束测试。本命令阶段不创建上述业务表。
+Raw Usage、scheduler/audit、payment payload hash 和 rollup 的 retention 必须配置化并区分合规需要；账本与财务证据不得因 dashboard retention 被删除。所有结构变更走 SQL-first migration，要求空库 up、连续升级、重复启动安全和约束测试。当前首批 schema 已落地，高增长表仍保持未分区，待真实基准数据证明需要后再迁移。
+
+## 7. 当前实现映射
+
+- `migrations/000001_initial_schema.sql` 创建本规划列出的身份、授权、模型、Provider、Credential、Route、Quota、Price、Request、Usage、Wallet、Payment、Audit、Outbox 和 Stats 核心表。
+- `migrations/000002_fact_table_guards.sql` 为 Usage、reconciliation、Wallet Ledger、Payment Event、Scheduler Decision 和 Audit 建立数据库级 append-only 防护，并校验 pool/credential 与 route target/provider 的归属一致性。
+- `migrations/000003_wallet_payment_integrity.sql` 补充 ISO 4217 大写币种格式、Usage 到 Wallet 的归属列和 payment event processing 状态表；已应用迁移保持不可变。
+- `internal/data` 使用 pgx/v5 连接池；repository 通过 `Querier` 依赖注入，`Store.WithTx` 是唯一事务边界，handler 不直接拼 SQL。
+- `cmd/bablo-migrate` 是显式迁移入口，默认 up；`BABLO_MIGRATION_ACTION=down` 只回滚最新版本。应用启动不自动改 schema。
+- 主键不设置数据库生成默认值，由应用调用 `internal/id.New` 生成 UUIDv7；数据库时间列统一 `timestamptz`，连接会话固定 UTC。

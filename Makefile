@@ -4,7 +4,7 @@ APP_NAME ?= bablo
 GO ?= go
 WEB_DIR ?= web
 
-.PHONY: fmt lint test test-race migrate dev build web-install web-dev
+.PHONY: fmt lint test test-race migrate migrate-down dev build web-install web-dev
 
 fmt:
 	$(GO) fmt ./...
@@ -21,8 +21,10 @@ test-race:
 	$(GO) test -race ./...
 
 migrate:
-	@echo "no migrations exist yet; run bablo-data before using this target" >&2
-	@exit 1
+	$(GO) run ./cmd/bablo-migrate
+
+migrate-down:
+	BABLO_MIGRATION_ACTION=down $(GO) run ./cmd/bablo-migrate
 
 dev:
 	$(GO) run ./cmd/bablo

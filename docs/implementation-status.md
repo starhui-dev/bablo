@@ -1,7 +1,7 @@
 # Bablo 实施状态
 
 > 最后更新：2026-08-29
-> 本次工作：完成 CPA SDK v7.2.145 精确锁定、inference adapter、生命周期与 fake provider 兼容测试；业务表尚未实现
+> 本次工作：完成 PostgreSQL 核心 schema、事实表保护、pgx 连接池、Goose 迁移入口、UUIDv7 生成器与数据层事务契约测试；认证业务尚未实现
 
 ## 1. 仓库审计结果
 
@@ -10,10 +10,10 @@
 | 根目录 | `.omp/`、`docs/`、Go/Vue bootstrap 文件 | 保留既有提示词与规划文档，新增实现文件 |
 | 后端 | 已建立 `go.mod`、`cmd/bablo/`、`internal/config`、`internal/httpapi`、`internal/inference` 和 CPA adapter | module 为 `github.com/starhui-dev/bablo`，CPA 仅在 adapter 边界 import |
 | 前端 | 已建立 Vue 3 + TypeScript + Vite + pnpm shell、路由、API client、登录/Dashboard/404 页面 | `web/package.json`、`web/pnpm-lock.yaml` |
-| 数据库 | 未创建业务表；`migrations/.gitkeep` 只保留目录 | 下一阶段执行 `bablo-data` |
+| 数据库 | 已落地 `migrations/000001_initial_schema.sql`、`000002_fact_table_guards.sql`、`000003_wallet_payment_integrity.sql`，覆盖规划核心实体和关键唯一约束 | `cmd/bablo-migrate` 显式执行 up/down；应用启动不自动改 schema |
 | CI/部署 | 已有 `Dockerfile`、`deploy/compose.dev.yaml`；尚无 CI workflow/生产部署 runbook | Compose 仅作为开发基础设施，生产硬化留到后续阶段 |
 | 文档 | 架构规划、ADR、README、LICENSE、CPA compatibility 证据均已存在 | 已更新实际 import/symbol/测试结果 |
-| Git | 已关联 `origin` 到 `git@github.com:starhui-dev/bablo.git` | CPA 修改尚未提交，不覆盖用户既有工作 |
+| Git | 已关联 `origin` 到 `git@github.com:starhui-dev/bablo.git` | 当前数据阶段修改尚未提交，不覆盖用户既有工作 |
 | CPA 本地使用 | `go.mod` 精确 pin `v7.2.145`；adapter Build/Run/Shutdown、Manager Execute/Stream 和映射测试已落盘 | 真实 Provider/OAuth E2E 仍缺外部凭据 |
 
 ## 2. 已落盘的规划
@@ -52,8 +52,8 @@
 | 1 | `bablo-plan` | 完成 | 范围、ADR、数据/API/安全、CPA 核验一致 |
 | 2 | `bablo-bootstrap` | 完成 | Go/Vue 骨架、配置、日志、优雅退出、health/ready、Makefile/lockfile、无真实 secret |
 | 3 | `bablo-cpa` | 完成（真实上游 E2E 后置） | pin/checksum、边界 adapter、fake provider non-stream/stream/cancel/error/shutdown/race |
-| 4 | `bablo-data` | 下一阶段 | migration 空库 up/升级/重复启动；核心约束、repository 事务测试 |
-| 5 | `bablo-auth` | users/sessions schema | 登录、Session hash/TTL/注销、CSRF、RBAC、管理员 TOTP/recovery 测试 |
+| 4 | `bablo-data` | 完成 | migration 空库 up/升级/重复启动；核心约束、append-only 防护、repository 事务测试 |
+| 5 | `bablo-auth` | users/sessions schema 已完成 | 登录、Session hash/TTL/注销、CSRF、RBAC、管理员 TOTP/recovery 测试 |
 | 6 | `bablo-apikey` | auth/policy 表 | Key 只显示一次/hash；revoked/expired/IP/limit；一 Key 多模型 E2E |
 | 7 | `bablo-models` | data layer | public/upstream model、capability、visibility、price version 管理和缺价拒绝 |
 | 8 | `bablo-credentials` | provider/model policy | AEAD secret/key rotation、状态/health/pool metadata；不泄漏 token |
@@ -89,15 +89,15 @@
 - 管理员 MFA 强制范围、用户邀请/注册、数据 retention/合规和首发协议范围；
 - 目标用户客户端（是否必须 `/v1/messages`、Gemini 等）。
 
-缺少上述信息不阻塞 `bablo-data` 或 fake provider 兼容测试，但阻塞真实上游/支付 E2E 和最终生产 GO；不得伪造凭据或验证结果。
+缺少上述信息不阻塞 `bablo-auth` 的本地实现或数据层回归，但阻塞真实上游/支付 E2E 和最终生产 GO；不得伪造凭据或验证结果。
 
 ## 7. 下一阶段
 
 ```text
-/bablo-data
+/bablo-auth
 ```
 
-CPA adapter 已完成当前阶段的公开 SDK 边界与 compatibility suite；下一步创建 PostgreSQL migration/repository 基线，但不提前实现 auth、wallet 或 payment 业务逻辑。
+数据阶段已完成：下一步实现 users/sessions/RBAC/MFA 认证服务；API Key、模型、Credential 和计费业务仍不得提前混入。
 
 ## 8. Bootstrap 验收与验证证据
 
@@ -106,7 +106,7 @@ CPA adapter 已完成当前阶段的公开 SDK 边界与 compatibility suite；�
 - `pnpm lint`、`pnpm typecheck`、`pnpm test`（2 tests）、`pnpm build` 全部通过；
 - 后端实际启动 smoke：`/healthz` 返回 200；`/readyz` 在 DB/Redis/Inference 未初始化时返回 503 和明确 checks；`/metrics` 返回 Prometheus 文本；
 - 前端实际浏览器 smoke 验证 Dashboard、`/login` 和未知路径 404，页面标题、导航、空状态和错误页面可见；
-- `git diff --check` 通过；文件未进入提交前仍有 bootstrap 未提交变更；
+- `git diff --check` 通过；当前数据阶段文件尚未提交，保留既有 CPA/Bootstrap 工作不覆盖。
 - Bootstrap 阶段未创建业务表或真实 secret；CPA 依赖与 compatibility suite 已在本阶段落盘。
 
 ## 9. CPA Adapter 验收与验证证据
@@ -117,3 +117,15 @@ CPA adapter 已完成当前阶段的公开 SDK 边界与 compatibility suite；�
 - fake provider 覆盖 non-stream、stream、401/429/5xx、caller cancel、stream close、request ID、credential pin、capability copy、service build/shutdown；
 - `go test -count=1 ./...` 通过；`go test -race -count=1 ./internal/inference/cpa` 通过；`go vet ./...` 通过；`go build -trimpath -o bin/bablo ./cmd/bablo` 通过；
 - CPA import 搜索确认源码 import 只存在于 `internal/inference/cpa/**`；真实 Provider/OAuth、Chat/Responses golden、首包后错误/failover 留到 credentials/proxy 阶段，当前不能宣称真实上游兼容。
+
+## 10. Data Layer 验收与验证证据
+
+- `go.mod` 精确 pin `github.com/jackc/pgx/v5 v5.10.0` 与 `github.com/pressly/goose/v3 v3.27.3`；Goose v3.27.3 要求 Go 1.25.7，当前项目/CPA Go 基线为 1.26.0，实际环境 Go 1.27.0。
+- `migrations/000001_initial_schema.sql` 覆盖 users/roles/sessions/MFA/API keys/policy/models/providers/credentials/pools/routes/quota/prices/requests/usage/wallet/payment/audit/outbox/stats；所有主键由应用 UUIDv7 提供。
+- `migrations/000002_fact_table_guards.sql` 建立事实表 append-only trigger 和 provider/pool/route target 归属校验；PostgreSQL 错误码断言已纳入集成测试。
+- `migrations/000003_wallet_payment_integrity.sql` 补充币种格式、Usage-Wallet 归属和 payment event processing 状态表；已应用迁移保持不可变。
+- `internal/data.Open` 解析 pgxpool、固定会话 timezone=UTC/application_name=bablo 并执行真实 Ping；`Store.WithTx` 提供提交/回滚边界。
+- `cmd/bablo-migrate` 与 Makefile `migrate`/`migrate-down` 可显式运行 schema 变更；应用启动不自动迁移。
+- `go test -count=1 ./internal/data` 在 `BABLO_TEST_DATABASE_URL` 指向 PostgreSQL 18.4 专用测试库时通过：空 schema up-by-one、连续升级、重复启动、核心唯一约束、append-only、Provider/pool/route target 归属约束和事务 commit/rollback。
+- 实际命令 smoke：迁移版本 `0 -> 1 -> 2 -> 3`，回滚 `3 -> 2`，再恢复到 `3`；Bablo HTTP 启动后 `/readyz` 报告 `postgres=ok`，未初始化 inference 仍保持 503，未伪造整体 ready。
+- Dockerfile 已同时构建 `bablo` 与嵌入迁移的 `bablo-migrate`；本机 Docker build 未通过，原因是 Docker Hub TLS 证书与 `registry-1.docker.io` 主机名不匹配（`x509`），不是 Go 编译错误，待修复构建环境后重试。

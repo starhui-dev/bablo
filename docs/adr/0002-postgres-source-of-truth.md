@@ -33,3 +33,9 @@ Bablo 的用户、Key、policy、模型目录、route、credential metadata、�
 1. CPA config.yaml/auth files 作为可写主库：绕过控制面和审计；
 2. Redis 作为钱包/Usage 主账：丢失、过期或双写会造成错账；
 3. 引入 Kafka/ClickHouse/Nacos 作为先决依赖：当前无真实性能证据，增加运维和一致性面。
+
+## 当前实现
+
+- 迁移采用精确锁定的 Goose `v3.27.3` SQL-first provider，配合 PostgreSQL session-level advisory lock；迁移文件位于 `migrations/`，已应用版本不得原地修改。
+- `cmd/bablo-migrate`/Makefile 显式执行 up 或单步 down；应用启动只连接并 Ping PostgreSQL，不自动修改 schema。
+- `internal/data.Store.WithTx` 统一 repository 事务边界，连接池由 pgx/v5 管理，数据库会话固定 `timezone=UTC`。
