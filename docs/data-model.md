@@ -27,6 +27,7 @@ erDiagram
     POLICIES ||--o{ API_KEY_POLICIES : assigned
     POLICIES ||--o{ POLICY_MODEL_ENTITLEMENTS : grants
     MODELS ||--o{ POLICY_MODEL_ENTITLEMENTS : allows
+    MODELS ||--o{ MODEL_ALIASES : resolves
     MODELS ||--o{ MODEL_ROUTES : exposes
     MODEL_ROUTES ||--o{ ROUTE_VERSIONS : versions
     ROUTE_VERSIONS ||--o{ ROUTE_TARGETS : contains
@@ -63,9 +64,9 @@ erDiagram
 
 ### Catalog / route / credential
 
-- `models`：public model ID/alias、canonical capabilities、visibility、billing class、enabled；
-- `providers`：slug、display name、`resource_type`（`official_api`/`enterprise_api`/`subscription`/`third_party`）、`commercial_allowed`、endpoint policy；
-- `provider_models`：`provider_id`, upstream model ID, protocol/capabilities, enabled；一个 public model 可对应多个 provider model；
+- `models`：canonical `public_model_id`、独立 `model_aliases`（禁用后仍保留标识不可重分配）、canonical capabilities、visibility、billing class、enabled；
+- `providers`：slug、display name、`resource_type`（`official_api`/`enterprise_api`/`subscription`/`third_party`）、`commercial_allowed`、endpoint policy；P0 对 subscription 强制不商业开放；
+- `provider_models`：`provider_id`, upstream model ID, protocol/capabilities, enabled, `review_status`、`discovery_status`、discovered/last-seen timestamps；发现新增项默认 pending/disabled，发现消失不自动禁用已批准配置；
 - `credentials`：provider、external stable ID、source kind、status、proxy/region metadata、pool state；
 - `credential_secrets`：credential 一对一或版本化记录，`ciphertext`, `nonce`, `key_version`, secret kind；与普通 credential metadata 分离；
 - `credential_pools`、`pool_members`：可供 route target 使用的资源池，成员有 priority/weight/enabled；
@@ -107,12 +108,13 @@ erDiagram
 | MFA | `(user_id, factor_type)`；recovery `(factor_id, code_hash)`，TOTP counter/恢复码消费在行锁事务内防重放 |
 | API Key | `secret_hash`；prefix 仅展示索引，不代替 hash |
 | entitlement | `(policy_id, model_id)` |
-| provider/model | `(provider_id, upstream_model_id)` |
+| provider/model | `(provider_id, upstream_model_id)`；发现和人工映射共用稳定上游 identity |
 | credential | `(provider_id, external_stable_id)`（无稳定 ID 时用受控 fingerprint） |
 | pool membership | `(pool_id, credential_id)` |
 | route version | `(route_id, version_no)`；target 顺序/目标 identity 在同一 version 内唯一 |
-| public model | `public_model_id` |
-| price | `(price_version_id, pricing_scope, dimension)`，同一 effective 版本不能重叠 |
+| public model/alias | `lower(public_model_id)`、`lower(alias)` 各自唯一且跨表互斥；禁用 alias 仍保留占位 |
+| price version | `(scope, version_no)`；同一 scope 的 published effective intervals 不重叠 |
+| price | `(price_version_id, pricing_scope, target, dimension)`；同一版本目标维度唯一 |
 | request | `request_id` |
 | usage settle | `settlement_key`（建议 logical request + terminal settlement version）；重复 finalize 返回已有结果 |
 | wallet ledger | `(wallet_id, idempotency_key)`；充值/扣费 reference 另加唯一约束 |
@@ -141,10 +143,11 @@ Raw Usage、scheduler/audit、payment payload hash 和 rollup 的 retention 必�
 
 ## 7. 当前实现映射
 
-- `migrations/000001_initial_schema.sql` 创建本规划列出的身份、授权、模型、Provider、Credential、Route、Quota、Price、Request、Usage、Wallet、Payment、Audit、Outbox 和 Stats 核心表。
+- `migrations/000001_initial_schema.sql` 创建身份、授权、模型、Provider、Credential、Route、Quota、Price、Request、Usage、Wallet、Payment、Audit、Outbox 和 Stats 核心表。
 - `migrations/000002_fact_table_guards.sql` 为 Usage、reconciliation、Wallet Ledger、Payment Event、Scheduler Decision 和 Audit 建立数据库级 append-only 防护，并校验 pool/credential 与 route target/provider 的归属一致性。
-- `migrations/000003_wallet_payment_integrity.sql` 补充 ISO 4217 大写币种格式、Usage 到 Wallet 的归属列和 payment event processing 状态表；已应用迁移保持不可变。
-- `migrations/000004_auth_security.sql` 增加 `password_changed_at`、Session-bound CSRF hash、MFA verified timestamp、TOTP replay counter、factor/recovery 唯一与可用索引；迁移时主动撤销无法绑定 CSRF 的旧 Session。
-- `internal/data` 使用 pgx/v5 连接池；repository 通过 `Querier` 依赖注入，`Store.WithTx` 是唯一事务边界，handler 不直接拼 SQL。
-- `cmd/bablo-migrate` 是显式迁移入口，默认 up；`BABLO_MIGRATION_ACTION=down` 只回滚最新版本。应用启动不自动改 schema。
-- 主键不设置数据库生成默认值，由应用调用 `internal/id.New` 生成 UUIDv7；数据库时间列统一 `timestamptz`，连接会话固定 UTC。
+- `migrations/000003_wallet_payment_integrity.sql`、`000004_auth_security.sql`、`000005_api_key_security.sql` 分别补充账务/支付、Web Session/MFA 和 API Key 安全约束；已应用迁移保持不可变。
+- `migrations/000006_model_catalog_integrity.sql` 新增 `model_aliases`、大小写不敏感且跨表互斥的 model identifier guards、provider model discovery/review 状态、published price entry/version guards 与生效区间互斥。
+- `internal/model` 实现 canonical ID/alias 解析、public/admin 列表、能力/visibility/billing class 校验和 route readiness；alias 禁用后不被重新分配。
+- `internal/provider` 实现资源政策、上游模型映射和完整 discovery snapshot reconcile；新增发现 pending/disabled，缺失只改变 discovery signal，批准配置不被发现覆盖。
+- `internal/pricing` 使用 decimal string + `numeric(30,12)`，实现 draft/activate/retire 与 provider_model -> model -> global 价格解析；缺价/禁用计费 fail closed。
+- `cmd/bablo/catalog.go` 将用户模型目录和 admin model/provider/price handlers 接入 Web Session/RBAC；`Store.WithTx` 保持 repository 事务边界，应用启动不自动迁移。

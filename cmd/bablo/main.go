@@ -130,6 +130,12 @@ func run(arguments []string) int {
 		if authHandler != nil {
 			serverOptions = append(serverOptions, httpapi.WithAPIKeyHandler(authHandler.Protect(apiKeyHandler)))
 		}
+		catalogOptions, err := catalogServerOptions(store, authHandler, logger)
+		if err != nil {
+			logger.Error("bablo_catalog_error", "error", err)
+			return 1
+		}
+		serverOptions = append(serverOptions, catalogOptions...)
 	} else if len(authCfg.EncryptionKey) > 0 {
 		logger.Error("bablo_auth_database_error", "error", "BABLO_DATABASE_URL is required when authentication is configured")
 		return 1

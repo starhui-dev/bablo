@@ -108,15 +108,14 @@ bablo auth reset-password --email user@example.com
 
 - `GET/POST/PATCH /api/v1/admin/users`
 - `GET/POST/PATCH /api/v1/admin/roles`
-- `GET/POST/PATCH /api/v1/admin/models`
-- `GET/POST/PATCH /api/v1/admin/providers`
-- `GET/POST/PATCH /api/v1/admin/credentials`
-- `POST /api/v1/admin/credentials/{id}/rotate-key`
-- `GET/POST/PATCH /api/v1/admin/credential-pools`
-- `GET/POST/PATCH /api/v1/admin/routes`
-- `POST /api/v1/admin/routes/preview`
-- `GET /api/v1/admin/routes/{id}/versions`
-- `GET/POST /api/v1/admin/prices`
+- `GET /api/v1/models`：已登录用户可见的 enabled/public 模型与 canonical capabilities/aliases；推理面的 `/v1/models` 仍由 proxy 阶段实现；
+- `GET/POST /api/v1/admin/models`、`GET/PATCH /api/v1/admin/models/{id}`：模型目录、别名、visibility、billing class、能力和启停；
+- `GET/POST /api/v1/admin/providers`、`GET/PATCH /api/v1/admin/providers/{id}`：Provider 资源类型、商业政策和启停；subscription 在 P0 强制 `commercial_allowed=false`；
+- `GET/POST /api/v1/admin/provider-models`、`GET/PATCH /api/v1/admin/provider-models/{id}`：上游模型映射、协议、能力和审核状态；列表必须按 `provider_id` 限定；
+- `POST /api/v1/admin/providers/{id}/reconcile`：提交一次完整发现快照；新增上游模型为 pending/disabled，消失只标记 discovery missing，不覆盖已批准业务配置；
+- `GET/POST /api/v1/admin/prices`、`GET /api/v1/admin/prices/{id}`：创建 draft 价格版本并查询完整条目；scope 为 global/model/provider_model；
+- `POST /api/v1/admin/prices/{id}/activate`、`POST /api/v1/admin/prices/{id}/retire`：发布/结束价格区间；发布后价格条目和版本身份不可修改；
+- `GET /api/v1/admin/credentials`
 - `GET /api/v1/admin/usage`
 - `GET /api/v1/admin/requests/{request_id}`
 - `GET /api/v1/admin/scheduler/decisions`
@@ -129,7 +128,10 @@ bablo auth reset-password --email user@example.com
 - `GET /api/v1/admin/audit-logs`
 - `GET /api/v1/admin/system`
 
-所有管理变更执行影响范围预览、危险操作二次确认（服务端 nonce/再认证）、审计写入。Credential endpoint 只返回类型、标识、key version、健康和更新时间，不回显 secret。
+
+请求 alias 必须先由 model service 解析为 canonical public model ID，再执行 Key entitlement、route 和价格解析；alias 本身不成为独立计费维度。
+
+模型/Provider/价格写操作均要求 Web Session、CSRF、admin RBAC 和生产 MFA；发现是信号，管理员批准/映射才会产生可路由的 provider model。价格金额使用 decimal string，缺少计费必需维度时解析失败，不按 0 收费。
 
 ## 4. 支付面（按 Provider 启用）
 

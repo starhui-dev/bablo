@@ -137,3 +137,49 @@ func TestAPIKeySurfaceMountsOnlyConfiguredPaths(t *testing.T) {
 		t.Fatalf("unconfigured API key status = %d, want 404", recorder.Code)
 	}
 }
+
+func TestCatalogSurfacesMountOnlyConfiguredPaths(t *testing.T) {
+	modelCalls := 0
+	adminCalls := 0
+	modelHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		modelCalls++
+		w.WriteHeader(http.StatusNoContent)
+	})
+	adminHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		adminCalls++
+		w.WriteHeader(http.StatusNoContent)
+	})
+	server := New(
+		config.Config{HTTPAddr: ":0"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		"test",
+		WithModelHandler(modelHandler),
+		WithAdminCatalogHandler(adminHandler),
+	)
+	paths := []string{
+		"/api/v1/models",
+		"/api/v1/admin/models",
+		"/api/v1/admin/providers/provider-id/reconcile",
+		"/api/v1/admin/provider-models/provider-model-id",
+		"/api/v1/admin/prices/price-id/activate",
+	}
+	for _, path := range paths {
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("path %s status = %d, want 204", path, recorder.Code)
+		}
+	}
+	if modelCalls != 1 || adminCalls != 4 {
+		t.Fatalf("catalog handler calls = model:%d admin:%d", modelCalls, adminCalls)
+	}
+
+	unconfigured := testServer()
+	for _, path := range paths {
+		recorder := httptest.NewRecorder()
+		unconfigured.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("unconfigured path %s status = %d, want 404", path, recorder.Code)
+		}
+	}
+}

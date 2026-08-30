@@ -55,8 +55,8 @@ Bablo InferenceEngine adapter]
 | `user` | 用户生命周期、状态、角色关系 | user ID、profile、role | 推理 Key 校验、账本 SQL |
 | `auth` | `internal/auth` 已实现登录、Argon2id、Session、密码、TOTP/recovery、RBAC/CSRF；`bablo auth` 提供本地管理员维护 | session principal、authorization decision、一次性 Cookie/MFA enrollment material | 把 Web Session 当推理 API Key、在 handler 绕过 service 授权 |
 | `apikey` | Key CSPRNG 生成/SHA-256 hash、一次性明文、撤销、过期、原子轮换、IP/RPM/TPM/预算阈值、policy entitlement | key principal、policy/model authorization decision | 保存明文 Key、把 Key 绑定单一 group/provider、把 Redis 当权限事实源 |
-| `model` | public model、能力、visibility、billing class | model capability、provider model | 散落模型字符串、直接覆盖人工目录 |
-| `provider` | Provider 元数据、资源政策 | provider ID、resource type | 处理 OAuth secret 明文 |
+| `model` | public model、canonical alias、能力、visibility、billing class、route readiness | model capability、alias resolution | 散落模型字符串、直接覆盖人工目录 |
+| `provider` | Provider 元数据、资源政策、上游模型发现/审核 | provider ID、provider model、discovery signal | 处理 OAuth secret 明文；把发现结果直接变成可路由配置 |
 | `credential` | 加密 secret metadata、健康、pool membership | credential ID、lease input | 日志输出 token、让 subscription 默认商业可用 |
 | `route` | public model 到版本化 target 的匹配/快照 | route snapshot、candidate targets | 未授权 fallback、请求中途变更快照 |
 | `scheduler` | 硬过滤、确定性选择、租约、Decision Log | candidates、policy、quota snapshot | 隐式随机、选择 disabled/revoked credential |
@@ -72,6 +72,8 @@ Bablo InferenceEngine adapter]
 ### Auth 已实现调用边界
 
 `internal/auth.Handler -> auth.Service -> auth.Repository -> internal/data.Store`。Handler 只负责 JSON、Cookie、Origin/CSRF 传输校验和稳定错误；密码验证、Session rotation、管理员 MFA 与角色判断在 Service；所有身份事实、Session 撤销、MFA counter/recovery code 消费和 audit 在 PostgreSQL 事务内完成。前端只消费 Bablo Session DTO，不接触 hash、MFA ciphertext 或数据库类型。
+
+管理员目录写接口统一经 `auth.Handler.ProtectRole(..., "admin")`，再由 model/provider/pricing service 复核输入、事务和 audit；普通 Web Session 只能访问用户模型目录，不能绕过 RBAC 写资源。
 
 P0 登录/MFA limiter 是有容量上限和自动过期的进程内状态，符合单实例首发边界；HA 前必须迁移为 Redis 协调实现。PostgreSQL 仍是用户、角色、Session 撤销、MFA 和 audit 的唯一事实源，Redis 丢失不能恢复权限或 Session。
 

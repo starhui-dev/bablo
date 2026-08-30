@@ -104,6 +104,34 @@ func (h *Handler) Protect(next http.Handler) http.Handler {
 	})
 }
 
+// ProtectRole authenticates a Web Session and enforces one RBAC role in the
+// auth service before a management handler receives the request.
+func (h *Handler) ProtectRole(next http.Handler, role string) http.Handler {
+	if next == nil {
+		next = http.NotFoundHandler()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var (
+			session Session
+			err     error
+		)
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			session, err = h.authenticate(r)
+		default:
+			session, err = h.authenticatedMutation(r)
+		}
+		if err == nil {
+			err = h.service.AuthorizeRole(session, role)
+		}
+		if err != nil {
+			h.writeError(w, r, err)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), sessionContextKey{}, session)))
+	})
+}
+
 // ServeHTTP dispatches authentication routes with the same JSON error envelope
 // used by the rest of the control plane.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

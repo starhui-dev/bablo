@@ -198,6 +198,34 @@ func TestAdminMFARecoveryAndRBAC(t *testing.T) {
 	if err := service.AdminResetPassword(ctx, normalLogin.Session, target.ID, "forbidden reset value", "reset_denied"); !errors.Is(err, ErrPermissionDenied) {
 		t.Fatalf("non-admin reset error = %v, want ErrPermissionDenied", err)
 	}
+
+	finalAdmin, err := service.VerifyMFA(ctx, secondPartial.Session, recoveryCodes[1], LoginMetadata{RemoteAddr: "192.0.2.10", RequestID: "recovery_admin_surface"})
+	if err != nil {
+		t.Fatalf("VerifyMFA(admin surface) error = %v", err)
+	}
+	handler, err := NewHandler(service, slog.New(slog.NewTextHandler(io.Discard, nil)), HandlerConfig{
+		AllowedOrigin: "https://console.example",
+		CookieSecure:  true,
+		SessionTTL:    12 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+	protected := handler.ProtectRole(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), "admin")
+	assertProtectedStatus := func(token string, want int) {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/models", nil)
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+		recorder := httptest.NewRecorder()
+		protected.ServeHTTP(recorder, request)
+		if recorder.Code != want {
+			t.Fatalf("ProtectRole() status = %d, body = %s, want %d", recorder.Code, recorder.Body.String(), want)
+		}
+	}
+	assertProtectedStatus(finalAdmin.SessionToken, http.StatusNoContent)
+	assertProtectedStatus(normalLogin.SessionToken, http.StatusForbidden)
 }
 
 func testAuthService(t *testing.T) (*Service, time.Time) {

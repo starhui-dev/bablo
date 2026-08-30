@@ -14,14 +14,16 @@ import (
 
 // Server is the Bablo HTTP server. Domain handlers are added in later stages.
 type Server struct {
-	config        config.Config
-	logger        *slog.Logger
-	version       string
-	httpServer    *http.Server
-	requestCount  atomic.Uint64
-	readiness     *Readiness
-	authHandler   http.Handler
-	apiKeyHandler http.Handler
+	config              config.Config
+	logger              *slog.Logger
+	version             string
+	httpServer          *http.Server
+	requestCount        atomic.Uint64
+	readiness           *Readiness
+	authHandler         http.Handler
+	apiKeyHandler       http.Handler
+	modelHandler        http.Handler
+	adminCatalogHandler http.Handler
 }
 
 // Option configures optional domain HTTP surfaces.
@@ -38,6 +40,20 @@ func WithAuthHandler(handler http.Handler) Option {
 func WithAPIKeyHandler(handler http.Handler) Option {
 	return func(server *Server) {
 		server.apiKeyHandler = handler
+	}
+}
+
+// WithModelHandler mounts the authenticated user model catalog.
+func WithModelHandler(handler http.Handler) Option {
+	return func(server *Server) {
+		server.modelHandler = handler
+	}
+}
+
+// WithAdminCatalogHandler mounts administrator-only model, provider, and price management.
+func WithAdminCatalogHandler(handler http.Handler) Option {
+	return func(server *Server) {
+		server.adminCatalogHandler = handler
 	}
 }
 
@@ -117,6 +133,19 @@ func (s *Server) routes() http.Handler {
 	if s.apiKeyHandler != nil {
 		mux.Handle("/api/v1/me/api-keys", s.apiKeyHandler)
 		mux.Handle("/api/v1/me/api-keys/", s.apiKeyHandler)
+	}
+	if s.modelHandler != nil {
+		mux.Handle("/api/v1/models", s.modelHandler)
+	}
+	if s.adminCatalogHandler != nil {
+		mux.Handle("/api/v1/admin/models", s.adminCatalogHandler)
+		mux.Handle("/api/v1/admin/models/", s.adminCatalogHandler)
+		mux.Handle("/api/v1/admin/providers", s.adminCatalogHandler)
+		mux.Handle("/api/v1/admin/providers/", s.adminCatalogHandler)
+		mux.Handle("/api/v1/admin/provider-models", s.adminCatalogHandler)
+		mux.Handle("/api/v1/admin/provider-models/", s.adminCatalogHandler)
+		mux.Handle("/api/v1/admin/prices", s.adminCatalogHandler)
+		mux.Handle("/api/v1/admin/prices/", s.adminCatalogHandler)
 	}
 	mux.HandleFunc("/", s.notFound)
 	return withRequestID(mux, s.logger, &s.requestCount)

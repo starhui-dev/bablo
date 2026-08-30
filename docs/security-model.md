@@ -32,6 +32,8 @@
 - TOTP secret 使用 AES-256-GCM，主密钥由 `BABLO_AUTH_ENCRYPTION_KEY` 以 32-byte base64 注入，ciphertext/nonce/key_version 写 PostgreSQL，AEAD AAD 绑定 factor ID、user ID 和 key version。当前只读取活动 key version；多版本解密和后台 re-encrypt 属于 credentials/security 阶段上线阻塞；
 - `bablo auth create-admin --email ...` 与 `bablo auth reset-password --email ...` 是本地可信运维入口，密码从无回显终端或 stdin 读取，不进入 argv；重置在单事务内更新 hash、撤销全部 Session、写 audit。没有可靠邮件基础设施时不伪造邮件重置；
 - 登录成功/失败、MFA 开始/启用/验证/恢复码重建、密码变更/重置和注销写 `audit_logs`；不记录密码、TOTP secret、恢复码、Cookie 或请求正文。
+- 模型/Provider/价格管理属于管理员敏感面：写操作通过 Web Session、CSRF、`admin` RBAC 和生产 MFA；模型 canonical ID 与 alias 在 PostgreSQL trigger 中大小写不敏感互斥，禁用 alias 不可被另一模型重分配。
+- Provider discovery 只写 pending/disabled 信号；reconcile 不接受客户端直接把未审核上游模型变成可路由目标，也不覆盖已批准的 model mapping、capabilities 或 enabled。价格 draft 发布前校验精确 decimal 和必需维度，published entries/版本身份由数据库 guard 保护。
 
 ### 推理面（API Key P0）
 
