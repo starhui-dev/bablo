@@ -83,6 +83,12 @@ P0 登录/MFA limiter 是有容量上限和自动过期的进程内状态，符�
 
 每个用户创建的 Key 拥有 default-deny managed policy；一个 policy 可允许多个 public model，显式 deny 优先于 allow。轮换原子替换同一 Key 的 hash，旧 secret 立即失效；P0 不提供双 Key 并行窗口。PostgreSQL 保存 Key、policy、授权和撤销事实；Redis 仅保存带 TTL 的固定窗口计数，Redis 丢失不能恢复权限或撤销状态。daily/monthly budget 阈值已进入 Key principal，真正消费门禁必须等待 Usage/Billing 事实源，不能把“尚无消费数据”伪装为零消费。
 
+### Route 调用边界
+
+`route.Service` 只负责把 requested public model/alias 解析为一个固定的 `route_version` 和有序 candidate targets；它不读取 API Key secret、不解密 Credential、不选择 pool member，也不执行上游请求。P0 仅支持 exact match，Route 创建或发布新版本在同一 PostgreSQL transaction 中校验 provider-model/pool 的 Provider 归属、模型映射和商业政策，关闭旧 version 后原子切换 `model_routes.active_version_id`。
+
+`route_versions` 与 `route_targets` 作为 immutable snapshot 保存；旧 version 只允许一次性写入 `effective_to`。管理员 preview 只返回 route candidates，不触发 scheduler 或 Credential runtime。推理流水线必须先完成 API Key entitlement，再使用 resolver 输出交给 scheduler。
+
 ## 4. 稳定领域接口
 
 以下是边界形状，不是对 CPA API 的猜测；实际 CPA 适配以 `docs/upstream-compatibility.md` 锁定 tag 源码为准：

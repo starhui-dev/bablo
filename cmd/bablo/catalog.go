@@ -11,6 +11,7 @@ import (
 	"github.com/starhui-dev/bablo/internal/model"
 	"github.com/starhui-dev/bablo/internal/pricing"
 	"github.com/starhui-dev/bablo/internal/provider"
+	"github.com/starhui-dev/bablo/internal/route"
 	"github.com/starhui-dev/bablo/internal/secret"
 )
 
@@ -57,6 +58,19 @@ func catalogServerOptions(store *data.Store, authHandler *auth.Handler, credenti
 		return nil, err
 	}
 
+	routeRepository, err := route.NewRepository(store)
+	if err != nil {
+		return nil, err
+	}
+	routeService, err := route.NewService(routeRepository)
+	if err != nil {
+		return nil, err
+	}
+	routeHandler, err := route.NewHandler(routeService, logger)
+	if err != nil {
+		return nil, err
+	}
+
 	var credentialHandler http.Handler
 	if credentialKeys != nil {
 		credentialRepository, err := credential.NewRepository(store, credentialKeys)
@@ -82,6 +96,8 @@ func catalogServerOptions(store *data.Store, authHandler *auth.Handler, credenti
 	adminCatalog.Handle("/api/v1/admin/provider-models/", providerHandler)
 	adminCatalog.Handle("/api/v1/admin/prices", pricingHandler)
 	adminCatalog.Handle("/api/v1/admin/prices/", pricingHandler)
+	adminCatalog.Handle("/api/v1/admin/routes", routeHandler)
+	adminCatalog.Handle("/api/v1/admin/routes/", routeHandler)
 	if credentialHandler != nil {
 		adminCatalog.Handle("/api/v1/admin/credentials", credentialHandler)
 		adminCatalog.Handle("/api/v1/admin/credentials/", credentialHandler)

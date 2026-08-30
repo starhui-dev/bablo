@@ -1,6 +1,7 @@
 package data
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -47,7 +48,7 @@ func TestProviderOwnershipConstraints(t *testing.T) {
 			{`INSERT INTO models (id, public_model_id, display_name) VALUES ($1, $2, 'test')`, []any{model, "ownership-model-" + model.String()}},
 			{`INSERT INTO provider_models (id, provider_id, model_id, upstream_model_id, protocol) VALUES ($1, $2, $3, $4, 'openai_chat'), ($5, $6, $3, $7, 'openai_chat')`, []any{providerModelA, providerA, model, "upstream-a-" + providerModelA.String(), providerModelB, providerB, "upstream-b-" + providerModelB.String()}},
 			{`INSERT INTO model_routes (id, model_id, match_value) VALUES ($1, $2, $3)`, []any{route, model, "ownership-route-" + route.String()}},
-			{`INSERT INTO route_versions (id, route_id, version_no, snapshot_hash) VALUES ($1, $2, 1, $3)`, []any{routeVersion, route, []byte("snapshot")}},
+			{`INSERT INTO route_versions (id, route_id, version_no, snapshot_hash) VALUES ($1, $2, 1, $3)`, []any{routeVersion, route, bytes.Repeat([]byte{0x5a}, 32)}},
 		}
 		for _, statement := range statements {
 			if _, err := q.Exec(ctx, statement.sql, statement.args...); err != nil {

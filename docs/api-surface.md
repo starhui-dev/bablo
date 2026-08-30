@@ -121,6 +121,10 @@ bablo auth reset-password --email user@example.com
 - `POST /api/v1/admin/credentials/{id}/reencrypt?kind=...`：按当前应用密钥重加密 active secret，保留版本历史；允许对 disabled/error Credential 执行，revoked 仅作为密钥迁移对象。
 - `GET /api/v1/admin/credentials/{id}/health`：返回 last success/error class、cooldown 和 observed timestamp，不返回 secret。
 - `GET/POST /api/v1/admin/credential-pools`、`POST/DELETE /api/v1/admin/credential-pools/{id}/members`：Provider-owned pool 与成员 priority/weight/enabled 管理；数据库拒绝跨 Provider 成员。
+- `GET/POST /api/v1/admin/routes`：按 `model_id`、opaque cursor 分页查询或创建 Route；P0 只接受 `exact`，创建时同时提交至少一个启用 target。
+- `GET/PATCH /api/v1/admin/routes/{id}`：查询 active route snapshot，或仅修改 Route metadata/enabled；已发布 version/target 不原地修改。
+- `GET/POST /api/v1/admin/routes/{id}/versions`：查询 immutable version history，或关闭旧 active version 并原子发布新的 target snapshot。
+- `GET /api/v1/admin/routes/preview?model={public_id_or_alias}`：管理员 dry-run；返回当前匹配的 route version 和所有 candidate target，不执行 scheduler、不触发 Credential 解密或上游请求。数据面仍必须先完成 API Key entitlement，再调用 Route resolver。
 - `GET /api/v1/admin/usage`
 - `GET /api/v1/admin/requests/{request_id}`
 - `GET /api/v1/admin/scheduler/decisions`

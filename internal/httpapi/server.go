@@ -145,6 +145,8 @@ func (s *Server) routes() http.Handler {
 		mux.Handle("/api/v1/admin/provider-models", s.adminCatalogHandler)
 		mux.Handle("/api/v1/admin/provider-models/", s.adminCatalogHandler)
 		mux.Handle("/api/v1/admin/prices", s.adminCatalogHandler)
+		mux.Handle("/api/v1/admin/routes", s.adminCatalogHandler)
+		mux.Handle("/api/v1/admin/routes/", s.adminCatalogHandler)
 		mux.Handle("/api/v1/admin/credentials", s.adminCatalogHandler)
 		mux.Handle("/api/v1/admin/credentials/", s.adminCatalogHandler)
 		mux.Handle("/api/v1/admin/credential-pools", s.adminCatalogHandler)

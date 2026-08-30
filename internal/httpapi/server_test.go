@@ -164,6 +164,8 @@ func TestCatalogSurfacesMountOnlyConfiguredPaths(t *testing.T) {
 		"/api/v1/admin/prices/price-id/activate",
 		"/api/v1/admin/credentials/credential-id/health",
 		"/api/v1/admin/credential-pools/pool-id/members",
+		"/api/v1/admin/routes/route-id/versions",
+		"/api/v1/admin/routes/preview",
 	}
 	for _, path := range paths {
 		recorder := httptest.NewRecorder()
@@ -172,8 +174,8 @@ func TestCatalogSurfacesMountOnlyConfiguredPaths(t *testing.T) {
 			t.Fatalf("path %s status = %d, want 204", path, recorder.Code)
 		}
 	}
-	if modelCalls != 1 || adminCalls != 6 {
-		t.Fatalf("catalog handler calls = model:%d admin:%d", modelCalls, adminCalls)
+	if modelCalls != 1 || adminCalls != 8 {
+		t.Fatalf("catalog handler calls = %d/%d, want model:1 admin:8", modelCalls, adminCalls)
 	}
 
 	unconfigured := testServer()

@@ -162,6 +162,35 @@ func TestCatalogManagementHTTPRequiresAdminAndPublishesPrices(t *testing.T) {
 	if approved.Code != http.StatusOK || !strings.Contains(approved.Body.String(), `"review_status":"approved"`) {
 		t.Fatalf("provider model approval = %d %s", approved.Code, approved.Body.String())
 	}
+	createdPool := catalogHTTPRequest(t, server.Handler(), adminBundle, http.MethodPost, "/api/v1/admin/credential-pools", map[string]any{
+		"provider_id": providerID, "name": "catalog-pool",
+	})
+	if createdPool.Code != http.StatusCreated {
+		t.Fatalf("credential pool create = %d %s", createdPool.Code, createdPool.Body.String())
+	}
+	poolID := responseUUID(t, createdPool.Body.Bytes(), "pool")
+	createdRoute := catalogHTTPRequest(t, server.Handler(), adminBundle, http.MethodPost, "/api/v1/admin/routes", map[string]any{
+		"model_id": modelID, "match_value": "catalog-latest",
+		"targets": []map[string]any{{"provider_model_id": providerModelID, "credential_pool_id": poolID}},
+	})
+	if createdRoute.Code != http.StatusCreated || !strings.Contains(createdRoute.Body.String(), `"version_no":1`) || !strings.Contains(createdRoute.Body.String(), `"upstream_model_id":"upstream-catalog-chat"`) {
+		t.Fatalf("route create = %d %s", createdRoute.Code, createdRoute.Body.String())
+	}
+	routeID := responseUUID(t, createdRoute.Body.Bytes(), "route")
+	preview := catalogHTTPRequest(t, server.Handler(), adminBundle, http.MethodGet, "/api/v1/admin/routes/preview?model=catalog-latest", nil)
+	if preview.Code != http.StatusOK || !strings.Contains(preview.Body.String(), `"model_public_id":"catalog-chat"`) || !strings.Contains(preview.Body.String(), `"upstream_model_id":"upstream-catalog-chat"`) {
+		t.Fatalf("route preview = %d %s", preview.Code, preview.Body.String())
+	}
+	publishedRoute := catalogHTTPRequest(t, server.Handler(), adminBundle, http.MethodPost, "/api/v1/admin/routes/"+routeID.String()+"/versions", map[string]any{
+		"targets": []map[string]any{{"provider_model_id": providerModelID, "credential_pool_id": poolID, "priority": 1}},
+	})
+	if publishedRoute.Code != http.StatusCreated || !strings.Contains(publishedRoute.Body.String(), `"version_no":2`) {
+		t.Fatalf("route version publish = %d %s", publishedRoute.Code, publishedRoute.Body.String())
+	}
+	versions := catalogHTTPRequest(t, server.Handler(), adminBundle, http.MethodGet, "/api/v1/admin/routes/"+routeID.String()+"/versions", nil)
+	if versions.Code != http.StatusOK || strings.Count(versions.Body.String(), `"route_id"`) != 2 {
+		t.Fatalf("route versions = %d %s", versions.Code, versions.Body.String())
+	}
 
 	createdPrice := catalogHTTPRequest(t, server.Handler(), adminBundle, http.MethodPost, "/api/v1/admin/prices", map[string]any{
 		"scope": "provider_model", "currency": "USD", "effective_from": now.Add(-time.Hour),
