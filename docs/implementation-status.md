@@ -1,19 +1,19 @@
 # Bablo 实施状态
 
 > 最后更新：2026-08-30
-> 本次工作：完成 `bablo-models` P0 模型/Provider/价格目录、alias 解析、发现审核、精确价格版本、管理员 MFA/RBAC HTTP 接入，以及真实 PostgreSQL/HTTP/竞态验证。
+> 本次工作：完成 `bablo-credentials` P0 Credential 加密存储、密钥版本轮换、健康观测、Provider pool 元数据、CPA runtime adapter 与管理员 HTTP API，并完成真实 PostgreSQL/HTTP/竞态验证。
 
 ## 1. 仓库审计结果
 
 | 项目 | 观察结果 | 证据/影响 |
 |---|---|---|
 | 根目录 | `.omp/`、`docs/`、Go/Vue bootstrap 文件 | 保留既有提示词与规划文档，新增实现文件 |
-| 后端 | 已建立 Go bootstrap、CPA adapter、data layer、`internal/auth`、`internal/apikey`、`internal/model`、`internal/provider`、`internal/pricing` 与共享 `internal/audit`；`cmd/bablo` 已接线用户模型目录和管理员 catalog API | Web Session 只保护管理面；admin catalog 强制 RBAC/MFA/CSRF；CPA 仍只在 adapter 边界 import |
-| 前端 | Vue 登录页已接通 Session/MFA 登录、CSRF header、路由守卫和退出；模型/Key 管理 UI 留到 `bablo-user`/`bablo-admin` | 当前目录 HTTP API 已可供后续 UI 使用，Dashboard/404 仍为业务壳 |
-| 数据库 | 已落地 `000001`–`000006` migrations；`000006_model_catalog_integrity.sql` 增加 model alias 互斥、Provider discovery/review 状态、published price append-only 与生效区间约束 | `cmd/bablo-migrate` 显式执行 up/down；应用启动不自动改 schema；migration 测试已升级至 v6 |
-| 文档 | 架构规划、ADR、README、LICENSE、CPA compatibility 证据均已存在 | API/data/security/architecture/status 已同步模型目录实际契约 |
-| Git | 已关联 `origin` 到 `git@github.com:starhui-dev/bablo.git` | 本阶段从干净 `main` 开始，只修改模型目录必需代码、迁移、测试和文档，未覆盖既有工作 |
-| CPA 本地使用 | `go.mod` 精确 pin `v7.2.145`；adapter Build/Run/Shutdown、Manager Execute/Stream 和映射测试已落盘 | 真实 Provider/OAuth E2E 仍缺外部凭据 |
+| 后端 | 已建立 Go bootstrap、CPA adapter、data layer、`internal/auth`、`internal/apikey`、`internal/model`、`internal/provider`、`internal/pricing`、`internal/credential` 与共享 `internal/audit`；`cmd/bablo` 已接线用户模型目录、管理员 catalog 和 Credential API | Web Session 只保护管理面；admin catalog 强制 RBAC/MFA/CSRF；CPA 仍只在 adapter 边界 import |
+| 前端 | Vue 登录页已接通 Session/MFA 登录、CSRF header、路由守卫和退出；模型/Key/Credential 管理 UI 留到后续前端阶段 | 当前目录 HTTP API 已可供后续 UI 使用，Dashboard/404 仍为业务壳 |
+| 数据库 | 已落地 `000001`–`000007` migrations；`000007_credential_security.sql` 增加 Credential 元数据/secret 约束、source-kind guard、secret history append-only、防撤销重激活、pool identity guard 和 active secret 索引 | `cmd/bablo-migrate` 显式执行 up/down；应用启动不自动改 schema；migration 测试已升级至 v7 |
+| 文档 | 架构规划、ADR、README、LICENSE、CPA compatibility 证据均已存在 | API/data/security/architecture/status 已同步模型目录与 Credential 实际契约 |
+| Git | 当前工作目录未检测到 `.git` 元数据，不能独立报告分支/未提交 diff | 未执行破坏性覆盖；保留既有文件并增量落盘 |
+| CPA 本地使用 | `go.mod` 精确 pin `v7.2.145`；adapter Build/Run/Shutdown、Manager Execute/Stream 和 Credential runtime 注册已接线 | 真实 Provider/OAuth E2E 仍缺外部凭据 |
 
 ## 2. 已落盘的规划
 
@@ -57,7 +57,7 @@
 | 5 | `bablo-auth` | 完成 | Argon2id 登录/rehash、Session hash/TTL/rotation/注销、Origin+CSRF、RBAC、管理员 TOTP/recovery、审计和本地 reset 均有测试 |
 | 6 | `bablo-apikey` | 完成 | 一次性明文/SHA-256 hash、owner/CSRF、revoked/expired/IP/RPM/TPM、原子 rotate/revoke、一 Key 多模型和 Redis 并发 E2E |
 | 7 | `bablo-models` | 完成 | public/upstream model、alias、capability、visibility、price version、Provider discovery/review、缺价拒绝和管理 API |
-| 8 | `bablo-credentials` | provider/model policy | AEAD secret/key rotation、状态/health/pool metadata；不泄漏 token |
+| 8 | `bablo-credentials` | provider/model policy | 完成：AEAD secret/key rotation、状态/health/pool metadata；不泄漏 token |
 | 9 | `bablo-router` | models/credentials/policy | exact route 多 target、version snapshot、preview、正确 resolved target |
 | 10 | `bablo-scheduler` | router + Redis lease interface | 硬过滤、确定性 priority/RR、TTL lease、Decision Log、并发测试 |
 | 11 | `bablo-proxy` | CPA adapter + scheduler | `/v1/models`、Chat、Responses；JSON/SSE、cancel、首包前后错误、request ID |
@@ -96,10 +96,10 @@
 ## 7. 下一阶段
 
 ```text
-/bablo-credentials
+/bablo-router
 ```
 
-`bablo-models` 已完成：下一步实现 Credential AEAD secret/key rotation、健康和 pool metadata；保持 Provider/CPA 类型隔离。
+`bablo-credentials` 已完成 P0 加密 Credential store、secret key rotation、健康状态、Provider pool metadata、CPA runtime bridge 和管理员 API；下一步实现 route target 与 version snapshot，继续保持 Provider/CPA 类型隔离。
 
 ## 8. Bootstrap 验收与验证证据
 
@@ -125,11 +125,11 @@
 - `go.mod` 精确 pin `github.com/jackc/pgx/v5 v5.10.0` 与 `github.com/pressly/goose/v3 v3.27.3`；Goose v3.27.3 要求 Go 1.25.7，当前项目/CPA Go 基线为 1.26.0，实际环境 Go 1.27.0。
 - `migrations/000001_initial_schema.sql` 覆盖 users/roles/sessions/MFA/API keys/policy/models/providers/credentials/pools/routes/quota/prices/requests/usage/wallet/payment/audit/outbox/stats；所有主键由应用 UUIDv7 提供。
 - `migrations/000002_fact_table_guards.sql` 建立事实表 append-only trigger 和 provider/pool/route target 归属校验；PostgreSQL 错误码断言已纳入集成测试。
-- `migrations/000003_wallet_payment_integrity.sql`、`000004_auth_security.sql`、`000005_api_key_security.sql` 与 `000006_model_catalog_integrity.sql` 依次补充账务/支付、Web Session/MFA、API Key 和模型目录/价格完整性；已应用迁移保持不可变。
+- `migrations/000003_wallet_payment_integrity.sql`、`000004_auth_security.sql`、`000005_api_key_security.sql`、`000006_model_catalog_integrity.sql` 与 `000007_credential_security.sql` 依次补充账务/支付、Web Session/MFA、API Key、模型目录/价格和 Credential 完整性；已应用迁移保持不可变。
 - `internal/data.Open` 解析 pgxpool、固定会话 timezone=UTC/application_name=bablo 并执行真实 Ping；`Store.WithTx` 提供提交/回滚边界。
 - `cmd/bablo-migrate` 与 Makefile `migrate`/`migrate-down` 可显式运行 schema 变更；应用启动不自动迁移。
-- `go test -count=1 ./internal/data` 在真实 PostgreSQL 测试库验证空 schema up-by-one、连续升级至 v6、重复启动、核心唯一约束、append-only、Provider/pool/route target 与模型/价格约束。
-- PostgreSQL 17-alpine 集成测试已验证完整 `0 -> 6`；Bablo `/readyz` 仍因 inference `not_initialized` 保持 503，未伪造整体 ready。
+- `go test -count=1 ./internal/data` 在真实 PostgreSQL 测试库验证空 schema up-by-one、连续升级至 v7、重复启动、核心唯一约束、append-only、Provider/pool/route target 与模型/价格/Credential 约束。
+- PostgreSQL 17-alpine 集成测试已验证完整 `0 -> 7`；Bablo `/readyz` 仍因 inference `not_initialized` 保持 503，未伪造整体 ready。
 
 ## 11. Auth 验收与验证证据
 
@@ -164,4 +164,16 @@
 - 管理 API 已接线 model/provider/provider-model collection 的 GET/POST、resource GET/PATCH、Provider reconcile 和 price create/get/activate/retire；统一通过 `ProtectRole(..., "admin")` 执行 Session、CSRF、admin RBAC 和生产 MFA，普通登录用户只能读取 `/api/v1/models`；所有写入同事务写 sanitized audit；
 - 真实 PostgreSQL 17-alpine 集成测试覆盖 alias promotion/冲突、discovery pending/approve/missing/no-overwrite、能力子集、模型能力收窄拒绝、缺价拒绝、Provider 级价格优先级、published mutation 55000、重叠区间拒绝、retired 历史解析与 replacement cutover；HTTP 端到端覆盖普通用户 403、管理员 model/provider/reconcile/approve/price activate 全链路；
 - 完整验证：真实 PostgreSQL 下 `go test -count=1 ./...`、`go test -race -count=1 ./internal/model ./internal/provider ./internal/pricing ./internal/auth ./internal/httpapi ./cmd/bablo`、`go vet ./...`、两个 Go binary build 全部通过；追加能力约束后 `go test -race -count=1 ./internal/model ./internal/provider ./internal/pricing` 通过；前端 `pnpm lint/typecheck/test/build` 通过；实际 `bablo` 进程 smoke 验证 `/healthz` 200、`/api/v1/models` 和 `/api/v1/admin/models` 未登录均 401；
-- 当前限制：CPA model registry 尚未接入自动 poller，reconcile 入口接受未来内部 worker 的完整发现快照；route/credential pool 未实现，因此 `route_configured=false` 是正常状态；真实价格表/币种/商业策略仍由业务提供，缺失保持 fail closed；下一阶段应进入 `bablo-credentials`，先实现加密 Credential store、Provider pool metadata 和健康/冷却状态，之后再接 `bablo-router`。
+- 当前限制：CPA model registry 尚未接入自动 poller，reconcile 入口接受未来内部 worker 的完整发现快照；route 未实现，Credential pool 已落地为 Provider-owned metadata 但尚未被 scheduler 消费；真实价格表/币种/商业策略仍由业务提供，缺失保持 fail closed；下一阶段应进入 `bablo-router`。
+
+## 14. Credentials 验收与验证证据
+
+- `internal/credential` 定义 Provider-owned Credential、source/status、secret descriptor、health、pool membership 和 transient `RuntimeCredential`；业务层不暴露 CPA 类型，只有 `internal/inference/cpa` 导入 CPA SDK。
+- Credential secret 使用应用层 AES-256-GCM；AAD 绑定 Credential ID、secret version ID、secret kind 和 key version；数据库仅保存 ciphertext、12-byte nonce、key version 与非敏感 metadata；密钥由 `BABLO_CREDENTIAL_ENCRYPTION_KEY`/版本化 `BABLO_CREDENTIAL_ENCRYPTION_KEYS` 注入，生产缺失时 fail closed。
+- secret create/rotate/reencrypt 均在服务层校验 source-kind、大小、重复 kind 和 metadata；历史 secret 通过数据库 trigger append-only 保护；撤销 Credential 不可重新激活；并发 rotate 在 Credential 行锁下分配连续 version，并使用 wall-clock rotation timestamp 满足时间约束。
+- `credential_health` 只接受不早于已观测时间的 snapshot；状态写入记录 last success/error/cooldown；pool membership 由数据库 trigger 强制 Credential 与 Pool 属于同一 Provider；管理员 API 不回显 secret，响应 `Cache-Control: no-store`。
+- 管理 API 已接线：`GET/POST /api/v1/admin/credentials`、`GET/PATCH /api/v1/admin/credentials/{id}`、`POST .../rotate|reencrypt`、`GET .../health`、`GET/POST /api/v1/admin/credential-pools`、`POST/DELETE .../members`；统一通过 admin RBAC/MFA/CSRF 保护，写入 sanitized audit。
+- CPA runtime bridge 使用锁定 `v7.2.145` 的公开 `sdk/cliproxy/auth`，映射为 `runtime_only=true` 的 CPA auth；PostgreSQL 仍是事实源，CPA runtime store 不回写业务 secret；Remove 只清理运行时状态。
+- 真实 PostgreSQL 17-alpine 集成测试覆盖 secret ciphertext/非泄漏、AAD/key rotation、secret rotate/reencrypt、health monotonicity、Provider pool 归属、复合游标分页和 12 路并发 rotate；HTTP 端到端覆盖管理员 create/health 与统一路由挂载；CPA 单测覆盖 OAuth/API key runtime mapping 和 unsupported source 清理。
+- 验证命令及结果：`BABLO_TEST_DATABASE_URL=... go test -count=1 ./...` 通过（13 packages、4 no-test packages）；`go test -race -count=1 ./internal/credential ./internal/inference/cpa ./internal/config ./internal/httpapi ./cmd/bablo` 通过；`go vet ./...`、`go build -trimpath -o /tmp/bablo-credential-final ./cmd/bablo`、`docker compose --env-file .env.example -f deploy/compose.dev.yaml config --quiet` 通过；前端 `pnpm --dir web lint/typecheck/test/build` 通过。
+- 当前限制：真实 OAuth refresh/provider executor E2E、credential 启动时从 PostgreSQL reconcile 到 CPA Manager 的主程序 wiring、scheduler 消费 pool、管理员 Credential UI、Redis/HA keyring reload 尚未实现或验证；这些不阻塞本地 Credential store，但阻塞整体生产 GO。

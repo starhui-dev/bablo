@@ -71,7 +71,10 @@ sdk/translator/builtin
 
 来源：<https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/v7.2.145/sdk/cliproxy/auth/conductor.go>、<https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/v7.2.145/sdk/cliproxy/executor/types.go>、<https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/v7.2.145/examples/custom-provider/main.go>。
 
-- core `auth.NewManager(Store, Selector, Hook)`；`Store` 为 `List/Save/Delete`；
+- core `auth.NewManager(Store, Selector, Hook)`；`Store` 为 `List/Save/Delete`；Bablo Credential runtime 使用 `auth.Manager.Register`、`List`、`GetByID`、`Remove` 和 `MarkResult`，不使用 CPA 的内部包。
+- runtime auth 映射为公开 `auth.Auth`：API key 放入 `Attributes[auth.AttributeAPIKey]`；OAuth access/refresh token 放入 `Metadata` 的 `access_token`/`refresh_token`；`Attributes[auth.AttributeRuntimeOnly] = "true"` 与 `AttributeSourceBackend = "bablo-postgres"` 使 CPA `persist` 跳过此 Bablo-owned runtime auth。
+- `auth.AuthSourcePostgres`、`auth.AttributeSourceBackend`、`auth.AttributeRuntimeOnly`、`auth.AttributeAuthKind`、`auth.AttributeAPIKey` 是本次已核验的公开常量；`Manager.Remove` 只删除运行时状态，不删除调用方事实源。
+- CPA `Manager.MarkResult` 只接收安全分类和 cooldown，不作为 Bablo Credential health 的事实源；Bablo 另行写入 `credential_health`。
 - `RoundRobinSelector`、`WeightedRoundRobinSelector`、`FillFirstSelector` 等；
 - Manager 的 auth lifecycle、executor registration、`Execute`/`ExecuteCount`/`ExecuteStream`、refresh/cooldown/retry 相关方法；
 - 自定义 `ProviderExecutor` 必须实现六个方法：`Identifier`、`Execute`、`ExecuteStream`、`Refresh`、`CountTokens`、`HttpRequest`；可选 `RequestPreparer`、`RequestAuthPreparer`、`ExecutionSessionCloser`；
@@ -121,6 +124,7 @@ sdk/translator/builtin
 - [x] fake provider 覆盖 non-stream/stream、stream headers/close、429/401/5xx、cancel、request ID、pinned credential、service build/shutdown；
 - [x] translator public format mapping 覆盖 OpenAI Responses、Claude；
 - [x] empty stream 已在 adapter 层拒绝；首包前后错误、partial output 后不 failover 仍需真实 proxy/上游协议阶段补齐；
+- [x] Credential runtime mapping/reconcile 使用公开 `sdk/cliproxy/auth`；API key/OAuth secret 仅在 runtime `Auth` 中存在，`runtime_only`/source backend 防止 CPA persist 回写；真实 upstream OAuth refresh 仍待后续 proxy 阶段。
 - [ ] credential refresh/cooldown/fallback 与 Bablo scheduler decision；CPA Manager 基础能力已核验，领域调度尚未实现；
 - [ ] 一个 Key 访问多个模型的端到端测试；依赖 apikey/models/router/proxy 阶段；
 - [ ] CPA tag 升级跑 compatibility + regression + race；当前仅完成锁定版本回归与 race；
@@ -128,7 +132,7 @@ sdk/translator/builtin
 
 ## 7. 本次 adapter 实现证据
 
-实际代码位于 `internal/inference/cpa/adapter.go`、`stream.go`、`doc.go`；Bablo 稳定契约位于 `internal/inference/inference.go` 与 `errors.go`。adapter 使用的 CPA public symbols：
+实际代码位于 `internal/inference/cpa/adapter.go`、`credential.go`、`stream.go`、`doc.go`；Bablo 稳定契约位于 `internal/inference/inference.go`、`errors.go` 与 `internal/credential`。adapter 使用的 CPA public symbols：
 
 ```text
 sdk/auth.GetTokenStore
@@ -140,15 +144,16 @@ sdk/cliproxy.Builder.WithCoreAuthManager
 sdk/cliproxy.Builder.Build
 sdk/cliproxy.Service.Run
 sdk/cliproxy.Service.Shutdown
-sdk/cliproxy/auth.NewManager
 sdk/cliproxy/auth.Manager.Register
-sdk/cliproxy/auth.Manager.RegisterExecutor
-sdk/cliproxy/auth.Manager.Execute
-sdk/cliproxy/auth.Manager.ExecuteStream
-sdk/cliproxy/auth.Manager.StopAutoRefresh
+sdk/cliproxy/auth.Manager.List
+sdk/cliproxy/auth.Manager.GetByID
+sdk/cliproxy/auth.Manager.Remove
+sdk/cliproxy/auth.Manager.MarkResult
+sdk/cliproxy/auth.AttributeAPIKey / AttributeAuthKind / AttributeRuntimeOnly / AttributeSource / AttributeSourceBackend
+sdk/cliproxy/auth.AuthSourcePostgres
 sdk/cliproxy/executor.Request / Options / Response / StreamResult / StreamChunk
 sdk/cliproxy/executor.RequestedModelMetadataKey / PinnedAuthMetadataKey
 sdk/translator.Format* / FromString
 ```
 
-验证命令及结果：`go test -count=1 ./...`、`go test -race -count=1 ./internal/inference/cpa`、`go vet ./...`、`go build -trimpath -o bin/bablo ./cmd/bablo` 均通过。fake provider 使用空 CPA model registry 做生命周期/错误/stream contract 测试；真实模型目录、协议翻译、首包后的 failover 仍必须在 `bablo-proxy` compatibility suite 验证，不能把本阶段测试当作真实上游 E2E。
+验证命令及结果：`go test -count=1 ./...`、`go test -race -count=1 ./internal/inference/cpa`、`go vet ./...`、`go build -trimpath -o bin/bablo ./cmd/bablo` 均通过。Credential 集成额外覆盖真实 PostgreSQL secret lifecycle、key rotation、复合游标、health 和 runtime source；fake runtime source 覆盖 CPA reconcile stale cleanup。fake provider 使用空 CPA model registry 做生命周期/错误/stream contract 测试；真实模型目录、协议翻译、OAuth refresh、首包后的 failover 仍必须在 `bablo-proxy` compatibility suite 验证，不能把本阶段测试当作真实上游 E2E。

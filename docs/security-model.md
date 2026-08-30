@@ -1,8 +1,8 @@
 # Bablo 安全模型
 
 > 目标：生产级多用户 AI Gateway 的控制面、推理面和账务安全基线
-> 日期：2026-08-29
-> 当前状态：P0 Web Session、CSRF、RBAC、管理员 TOTP/恢复码已实现；推理 Key、Credential 和支付安全仍按后续阶段落地
+> 日期：2026-08-30
+> 当前状态：P0 Web Session、CSRF、RBAC、管理员 TOTP/恢复码、推理 API Key 与上游 Credential AEAD/轮换已实现；route/proxy、支付和生产安全门禁仍按后续阶段落地。
 
 ## 1. 资产与信任边界
 
@@ -47,11 +47,12 @@
 
 ## 3. Secret 与加密
 
-- Credential secret 在应用层使用成熟 AEAD（AES-256-GCM 或等价方案），存 ciphertext、nonce、key_version、secret kind；
-- 主密钥仅来自环境变量/secret manager，不进仓库、镜像、数据库普通字段或日志；
-- 新写入使用当前 key version；后台分批 re-encrypt，保留失败重试和审计；轮换期间读取按 key_version 解密，轮换完成后可撤销旧 key；
-- secret metadata 与业务 Credential 分离；API/UI 只返回类型、外部标识、更新时间、key version、健康，不回显完整 token；
-- 备份、dump、crash dump、trace/span attributes、错误消息都按 secret 处理；定期 secret scan。
+- Credential secret 已使用 AES-256-GCM，存 ciphertext、12-byte nonce、key_version、secret kind；AAD 绑定 Credential ID、secret version ID、secret kind 和 key version；
+- 主密钥仅从 `BABLO_CREDENTIAL_ENCRYPTION_KEY` 或版本化 `BABLO_CREDENTIAL_ENCRYPTION_KEYS` 注入，不进仓库、镜像、数据库普通字段或日志；生产缺失 key 时启动 fail closed；
+- 新写入使用当前 key version；管理员 re-encrypt 创建新历史版本并原子 retire 旧 active version，读取按 key_version 选择旧/新 key；旧 key 只能在全部记录迁移和验证后撤销；
+- secret history 由 PostgreSQL trigger 阻止 ciphertext/nonce/key/version/delete 篡改；只有 `rotated_at NULL -> timestamp` 是允许的历史状态转换；并发 rotate 在 Credential 行锁下保持每 kind 单一 active version；
+- secret metadata 与业务 Credential 分离；API/UI 只返回类型、外部标识、时间、key version、健康，不回显完整 token；CPA runtime auth 标记 `runtime_only` 且只能由 PostgreSQL source reconcile；
+- 备份、dump、crash dump、trace/span attributes、错误消息都按 secret 处理；测试失败消息也不得格式化 `RuntimeCredential`/CPA `Auth`；定期 secret scan。
 
 ## 4. 路由、上游与 SSRF
 

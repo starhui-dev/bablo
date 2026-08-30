@@ -22,6 +22,7 @@ import (
 	"github.com/starhui-dev/bablo/internal/config"
 	"github.com/starhui-dev/bablo/internal/data"
 	"github.com/starhui-dev/bablo/internal/httpapi"
+	"github.com/starhui-dev/bablo/internal/secret"
 	"github.com/starhui-dev/bablo/migrations"
 )
 
@@ -31,6 +32,10 @@ func TestCatalogManagementHTTPRequiresAdminAndPublishesPrices(t *testing.T) {
 	box, err := auth.NewSecretBox(bytes.Repeat([]byte{0x31}, 32), "catalog-test-v1")
 	if err != nil {
 		t.Fatalf("auth.NewSecretBox() error = %v", err)
+	}
+	credentialKeyring, err := secret.NewKeyring("v1", map[string][]byte{"v1": bytes.Repeat([]byte{0x41}, 32)})
+	if err != nil {
+		t.Fatalf("secret.NewKeyring() error = %v", err)
 	}
 	authRepository, err := auth.NewRepository(store)
 	if err != nil {
@@ -84,7 +89,7 @@ func TestCatalogManagementHTTPRequiresAdminAndPublishesPrices(t *testing.T) {
 	if err != nil {
 		t.Fatalf("auth.NewHandler() error = %v", err)
 	}
-	options, err := catalogServerOptions(store, authHandler, logger)
+	options, err := catalogServerOptions(store, authHandler, credentialKeyring, logger)
 	if err != nil {
 		t.Fatalf("catalogServerOptions() error = %v", err)
 	}
@@ -121,6 +126,19 @@ func TestCatalogManagementHTTPRequiresAdminAndPublishesPrices(t *testing.T) {
 		t.Fatalf("provider create = %d %s", createdProvider.Code, createdProvider.Body.String())
 	}
 	providerID := responseUUID(t, createdProvider.Body.Bytes(), "provider")
+	createdCredential := catalogHTTPRequest(t, server.Handler(), adminBundle, http.MethodPost, "/api/v1/admin/credentials", map[string]any{
+		"provider_id": providerID, "external_stable_id": "catalog-credential", "source_kind": "api_key",
+		"metadata": map[string]string{"account_email": "catalog@example.test"},
+		"secrets":  []map[string]string{{"kind": "api_key", "value": "catalog-secret-value"}},
+	})
+	if createdCredential.Code != http.StatusCreated || strings.Contains(createdCredential.Body.String(), "catalog-secret-value") {
+		t.Fatalf("credential create = %d %s", createdCredential.Code, createdCredential.Body.String())
+	}
+	credentialID := responseUUID(t, createdCredential.Body.Bytes(), "credential")
+	credentialHealth := catalogHTTPRequest(t, server.Handler(), adminBundle, http.MethodGet, "/api/v1/admin/credentials/"+credentialID.String()+"/health", nil)
+	if credentialHealth.Code != http.StatusOK || strings.Contains(credentialHealth.Body.String(), "catalog-secret-value") {
+		t.Fatalf("credential health = %d %s", credentialHealth.Code, credentialHealth.Body.String())
+	}
 	reconciled := catalogHTTPRequest(t, server.Handler(), adminBundle, http.MethodPost, "/api/v1/admin/providers/"+providerID.String()+"/reconcile", map[string]any{
 		"models": []map[string]any{{
 			"upstream_model_id": "upstream-catalog-chat",

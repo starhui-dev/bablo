@@ -33,7 +33,7 @@ func TestMigrationsUpgradeAndRepeatSafely(t *testing.T) {
 	if _, err := provider.Up(ctx); err != nil {
 		t.Fatalf("upgrade to latest: %v", err)
 	}
-	if version, err := provider.GetDBVersion(ctx); err != nil || version != 6 {
+	if version, err := provider.GetDBVersion(ctx); err != nil || version != 7 {
 		t.Fatalf("version after upgrade = %d, %v", version, err)
 	}
 	results, err := provider.Up(ctx)
@@ -53,19 +53,19 @@ func TestLatestModelCatalogMigrationDownAndUp(t *testing.T) {
 	if err := Migrate(ctx, url, migrations.Files, logger); err != nil {
 		t.Fatalf("Migrate() error = %v", err)
 	}
-	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 6 {
+	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 7 {
 		t.Fatalf("version before rollback = %d, %v", version, err)
 	}
 	if err := MigrateDown(ctx, url, migrations.Files, logger); err != nil {
 		t.Fatalf("MigrateDown() error = %v", err)
 	}
-	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 5 {
+	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 6 {
 		t.Fatalf("version after rollback = %d, %v", version, err)
 	}
 	if err := Migrate(ctx, url, migrations.Files, logger); err != nil {
 		t.Fatalf("Migrate() after rollback error = %v", err)
 	}
-	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 6 {
+	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 7 {
 		t.Fatalf("version after restore = %d, %v", version, err)
 	}
 }

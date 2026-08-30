@@ -14,6 +14,7 @@ import (
 	"github.com/starhui-dev/bablo/internal/config"
 	"github.com/starhui-dev/bablo/internal/data"
 	"github.com/starhui-dev/bablo/internal/httpapi"
+	"github.com/starhui-dev/bablo/internal/secret"
 )
 
 var buildVersion = "dev"
@@ -43,12 +44,26 @@ func run(arguments []string) int {
 		logger.Error("bablo_auth_config_error", "error", err)
 		return 1
 	}
+	credentialCfg, err := config.LoadCredential(cfg.Environment)
+	if err != nil {
+		logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+		logger.Error("bablo_credential_config_error", "error", err)
+		return 1
+	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	var store *data.Store
 	var authHandler *auth.Handler
 	var redisReady bool
 	var serverOptions []httpapi.Option
+	var credentialKeys *secret.Keyring
+	if len(credentialCfg.Keys) > 0 {
+		credentialKeys, err = secret.NewKeyring(credentialCfg.CurrentVersion, credentialCfg.Keys)
+		if err != nil {
+			logger.Error("bablo_credential_keyring_error", "error", err)
+			return 1
+		}
+	}
 	if cfg.DatabaseURL != "" {
 		connectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		store, err = data.Open(connectCtx, data.Config{URL: cfg.DatabaseURL})
@@ -130,14 +145,14 @@ func run(arguments []string) int {
 		if authHandler != nil {
 			serverOptions = append(serverOptions, httpapi.WithAPIKeyHandler(authHandler.Protect(apiKeyHandler)))
 		}
-		catalogOptions, err := catalogServerOptions(store, authHandler, logger)
+		catalogOptions, err := catalogServerOptions(store, authHandler, credentialKeys, logger)
 		if err != nil {
 			logger.Error("bablo_catalog_error", "error", err)
 			return 1
 		}
 		serverOptions = append(serverOptions, catalogOptions...)
-	} else if len(authCfg.EncryptionKey) > 0 {
-		logger.Error("bablo_auth_database_error", "error", "BABLO_DATABASE_URL is required when authentication is configured")
+	} else if len(authCfg.EncryptionKey) > 0 || credentialKeys != nil {
+		logger.Error("bablo_secret_database_error", "error", "BABLO_DATABASE_URL is required when authentication or Credential storage is configured")
 		return 1
 	}
 

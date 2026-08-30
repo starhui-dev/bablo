@@ -57,7 +57,7 @@ Bablo InferenceEngine adapter]
 | `apikey` | Key CSPRNG 生成/SHA-256 hash、一次性明文、撤销、过期、原子轮换、IP/RPM/TPM/预算阈值、policy entitlement | key principal、policy/model authorization decision | 保存明文 Key、把 Key 绑定单一 group/provider、把 Redis 当权限事实源 |
 | `model` | public model、canonical alias、能力、visibility、billing class、route readiness | model capability、alias resolution | 散落模型字符串、直接覆盖人工目录 |
 | `provider` | Provider 元数据、资源政策、上游模型发现/审核 | provider ID、provider model、discovery signal | 处理 OAuth secret 明文；把发现结果直接变成可路由配置 |
-| `credential` | 加密 secret metadata、健康、pool membership | credential ID、lease input | 日志输出 token、让 subscription 默认商业可用 |
+| `credential` | 加密 secret metadata、健康、pool membership、active runtime source | Credential ID、非敏感 metadata、transient runtime credential | 日志输出 token、让 subscription 默认商业可用 |
 | `route` | public model 到版本化 target 的匹配/快照 | route snapshot、candidate targets | 未授权 fallback、请求中途变更快照 |
 | `scheduler` | 硬过滤、确定性选择、租约、Decision Log | candidates、policy、quota snapshot | 隐式随机、选择 disabled/revoked credential |
 | `usage` | request/attempt、immutable UsageEvent、reconcile/outbox | token/status/latency、settlement key | 依赖 CPA usage queue 作为最终账 |
@@ -130,7 +130,7 @@ type Stream interface {
 5. 预算预检：低成本请求可直接门禁，长上下文/高价请求写 reservation；
 6. route 精确匹配得到 candidates；
 7. scheduler 硬过滤 enabled、支持能力、resource policy、cooldown、quota freshness、concurrency lease，再按确定性策略选择；
-8. 通过 CPA adapter 执行非流式/流式；所有上游错误映射到 Bablo error class；
+8. 通过 CPA adapter 执行非流式/流式；Credential runtime 由 PostgreSQL service 解密后以 `runtime_only` auth 注册，CPA 不成为主数据源；所有上游错误映射到 Bablo error class；
 9. 发送响应。流式首个 payload 发出后不得透明切换 credential；客户端取消仍须释放租约并尽力取得 usage；
 10. 生成一次 immutable UsageEvent，按 resolved provider/model/route/credential/price version 结算；
 11. 在同一事务写 settlement/outbox，异步更新 stats、health、reconciliation；

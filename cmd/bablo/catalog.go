@@ -5,14 +5,16 @@ import (
 	"net/http"
 
 	"github.com/starhui-dev/bablo/internal/auth"
+	"github.com/starhui-dev/bablo/internal/credential"
 	"github.com/starhui-dev/bablo/internal/data"
 	"github.com/starhui-dev/bablo/internal/httpapi"
 	"github.com/starhui-dev/bablo/internal/model"
 	"github.com/starhui-dev/bablo/internal/pricing"
 	"github.com/starhui-dev/bablo/internal/provider"
+	"github.com/starhui-dev/bablo/internal/secret"
 )
 
-func catalogServerOptions(store *data.Store, authHandler *auth.Handler, logger *slog.Logger) ([]httpapi.Option, error) {
+func catalogServerOptions(store *data.Store, authHandler *auth.Handler, credentialKeys *secret.Keyring, logger *slog.Logger) ([]httpapi.Option, error) {
 	if authHandler == nil {
 		return nil, nil
 	}
@@ -55,6 +57,22 @@ func catalogServerOptions(store *data.Store, authHandler *auth.Handler, logger *
 		return nil, err
 	}
 
+	var credentialHandler http.Handler
+	if credentialKeys != nil {
+		credentialRepository, err := credential.NewRepository(store, credentialKeys)
+		if err != nil {
+			return nil, err
+		}
+		credentialService, err := credential.NewService(credentialRepository, credentialKeys)
+		if err != nil {
+			return nil, err
+		}
+		credentialHandler, err = credential.NewHandler(credentialService, logger)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	adminCatalog := http.NewServeMux()
 	adminCatalog.Handle("/api/v1/admin/models", modelHandler)
 	adminCatalog.Handle("/api/v1/admin/models/", modelHandler)
@@ -64,6 +82,12 @@ func catalogServerOptions(store *data.Store, authHandler *auth.Handler, logger *
 	adminCatalog.Handle("/api/v1/admin/provider-models/", providerHandler)
 	adminCatalog.Handle("/api/v1/admin/prices", pricingHandler)
 	adminCatalog.Handle("/api/v1/admin/prices/", pricingHandler)
+	if credentialHandler != nil {
+		adminCatalog.Handle("/api/v1/admin/credentials", credentialHandler)
+		adminCatalog.Handle("/api/v1/admin/credentials/", credentialHandler)
+		adminCatalog.Handle("/api/v1/admin/credential-pools", credentialHandler)
+		adminCatalog.Handle("/api/v1/admin/credential-pools/", credentialHandler)
+	}
 
 	return []httpapi.Option{
 		httpapi.WithModelHandler(authHandler.Protect(modelHandler)),

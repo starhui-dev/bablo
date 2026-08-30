@@ -8,10 +8,9 @@
 
 - 所有主键使用项目统一的 UUIDv7（若实现阶段因驱动限制采用等价有序 UUID，必须在 ADR/迁移说明）；时间统一 UTC `timestamptz`；
 - 金额用 `amount_minor bigint` + `currency char(3)`，或经核准的 PostgreSQL `numeric`；禁止 float；
-- Token、计数、版本号使用整数；延迟使用整数微秒/毫秒，避免隐式浮点；
-- 账本、UsageEvent、PaymentEvent、AuditLog 追加式且不可破坏式删除；纠错新增 adjustment/reconciliation；
-- API Key 只存不可逆 hash、短 prefix、元数据；Credential secret 只存 AEAD ciphertext、nonce、key_version；
-- 所有业务外键明确租户/所有者检查，禁止仅靠前端隔离；
+- 账本、UsageEvent、PaymentEvent、AuditLog 追加式且不可破坏式删除；纠错新增 adjustment/reconciliation；Credential secret history 只允许追加新版本和设置 rotated_at，不允许删除/篡改密文；
+- API Key 只存不可逆 hash、短 prefix、元数据；Credential secret 只存 AEAD ciphertext、12-byte nonce、key_version；
+- 所有业务外键明确租户/所有者检查，禁止仅靠前端隔离；Credential pool 与 Credential 必须属于同一 Provider；
 - route 和 price 在请求开始时形成不可变 snapshot，后续配置修改不重写历史。
 
 ## 2. 核心实体关系
@@ -147,7 +146,9 @@ Raw Usage、scheduler/audit、payment payload hash 和 rollup 的 retention 必�
 - `migrations/000002_fact_table_guards.sql` 为 Usage、reconciliation、Wallet Ledger、Payment Event、Scheduler Decision 和 Audit 建立数据库级 append-only 防护，并校验 pool/credential 与 route target/provider 的归属一致性。
 - `migrations/000003_wallet_payment_integrity.sql`、`000004_auth_security.sql`、`000005_api_key_security.sql` 分别补充账务/支付、Web Session/MFA 和 API Key 安全约束；已应用迁移保持不可变。
 - `migrations/000006_model_catalog_integrity.sql` 新增 `model_aliases`、大小写不敏感且跨表互斥的 model identifier guards、provider model discovery/review 状态、published price entry/version guards 与生效区间互斥。
+- `migrations/000007_credential_security.sql` 增加 Credential runtime metadata、source-kind/secret ciphertext/key/rotation 约束、source identity guard、secret history append-only、pool identity guard 和 active-secret 索引。
 - `internal/model` 实现 canonical ID/alias 解析、public/admin 列表、能力/visibility/billing class 校验和 route readiness；alias 禁用后不被重新分配。
 - `internal/provider` 实现资源政策、上游模型映射和完整 discovery snapshot reconcile；新增发现 pending/disabled，缺失只改变 discovery signal，批准配置不被发现覆盖。
+- `internal/credential` 实现 non-secret DTO、AES-GCM secret create/rotate/reencrypt、active runtime source、monotonic health、Provider pool membership 和 opaque composite cursor；管理员 API 永不返回 secret value。
 - `internal/pricing` 使用 decimal string + `numeric(30,12)`，实现 draft/activate/retire 与 provider_model -> model -> global 价格解析；缺价/禁用计费 fail closed。
 - `cmd/bablo/catalog.go` 将用户模型目录和 admin model/provider/price handlers 接入 Web Session/RBAC；`Store.WithTx` 保持 repository 事务边界，应用启动不自动迁移。

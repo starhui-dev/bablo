@@ -115,12 +115,16 @@ bablo auth reset-password --email user@example.com
 - `POST /api/v1/admin/providers/{id}/reconcile`：提交一次完整发现快照；新增上游模型为 pending/disabled，消失只标记 discovery missing，不覆盖已批准业务配置；
 - `GET/POST /api/v1/admin/prices`、`GET /api/v1/admin/prices/{id}`：创建 draft 价格版本并查询完整条目；scope 为 global/model/provider_model；
 - `POST /api/v1/admin/prices/{id}/activate`、`POST /api/v1/admin/prices/{id}/retire`：发布/结束价格区间；发布后价格条目和版本身份不可修改；
-- `GET /api/v1/admin/credentials`
+- `GET/POST /api/v1/admin/credentials`：分页列出或创建 Provider Credential；创建 secret 只接受一次性请求正文，响应仅返回 descriptor，不返回值。
+- `GET/PATCH /api/v1/admin/credentials/{id}`：查询或修改 region/proxy/非敏感 metadata/status；Provider、external stable ID、source kind 不可变。
+- `POST /api/v1/admin/credentials/{id}/rotate`：按 `kind` 原子轮换 secret，旧版本只保留 ciphertext/history descriptor。
+- `POST /api/v1/admin/credentials/{id}/reencrypt?kind=...`：按当前应用密钥重加密 active secret，保留版本历史；允许对 disabled/error Credential 执行，revoked 仅作为密钥迁移对象。
+- `GET /api/v1/admin/credentials/{id}/health`：返回 last success/error class、cooldown 和 observed timestamp，不返回 secret。
+- `GET/POST /api/v1/admin/credential-pools`、`POST/DELETE /api/v1/admin/credential-pools/{id}/members`：Provider-owned pool 与成员 priority/weight/enabled 管理；数据库拒绝跨 Provider 成员。
 - `GET /api/v1/admin/usage`
 - `GET /api/v1/admin/requests/{request_id}`
 - `GET /api/v1/admin/scheduler/decisions`
 - `GET /api/v1/admin/credentials/{id}/quota`
-- `GET /api/v1/admin/credentials/{id}/health`
 - `POST /api/v1/admin/wallets/{user_id}/adjustments`
 - `GET /api/v1/admin/payment-orders`
 - `POST /api/v1/admin/payment-orders/{order_no}/close`
