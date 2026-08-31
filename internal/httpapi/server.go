@@ -24,6 +24,7 @@ type Server struct {
 	apiKeyHandler       http.Handler
 	modelHandler        http.Handler
 	adminCatalogHandler http.Handler
+	inferenceHandler    http.Handler
 }
 
 // Option configures optional domain HTTP surfaces.
@@ -47,6 +48,13 @@ func WithAPIKeyHandler(handler http.Handler) Option {
 func WithModelHandler(handler http.Handler) Option {
 	return func(server *Server) {
 		server.modelHandler = handler
+	}
+}
+
+// WithInferenceHandler mounts the authenticated OpenAI-compatible inference surface.
+func WithInferenceHandler(handler http.Handler) Option {
+	return func(server *Server) {
+		server.inferenceHandler = handler
 	}
 }
 
@@ -152,6 +160,11 @@ func (s *Server) routes() http.Handler {
 		mux.Handle("/api/v1/admin/credential-pools", s.adminCatalogHandler)
 		mux.Handle("/api/v1/admin/credential-pools/", s.adminCatalogHandler)
 		mux.Handle("/api/v1/admin/prices/", s.adminCatalogHandler)
+	}
+	if s.inferenceHandler != nil {
+		mux.Handle("/v1/models", s.inferenceHandler)
+		mux.Handle("/v1/chat/completions", s.inferenceHandler)
+		mux.Handle("/v1/responses", s.inferenceHandler)
 	}
 	mux.HandleFunc("/", s.notFound)
 	return withRequestID(mux, s.logger, &s.requestCount)

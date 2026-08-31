@@ -187,3 +187,34 @@ func TestCatalogSurfacesMountOnlyConfiguredPaths(t *testing.T) {
 		}
 	}
 }
+
+func TestInferenceSurfaceMountsOnlyConfiguredPaths(t *testing.T) {
+	calls := 0
+	inferenceHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusNoContent)
+	})
+	server := New(
+		config.Config{HTTPAddr: ":0"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		"test",
+		WithInferenceHandler(inferenceHandler),
+	)
+	for _, path := range []string{"/v1/models", "/v1/chat/completions", "/v1/responses"} {
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("path %s status = %d, want 204", path, recorder.Code)
+		}
+	}
+	if calls != 3 {
+		t.Fatalf("inference handler calls = %d, want 3", calls)
+	}
+	for _, path := range []string{"/v1/models/", "/v1/unknown"} {
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("unmatched path %s status = %d, want 404", path, recorder.Code)
+		}
+	}
+}

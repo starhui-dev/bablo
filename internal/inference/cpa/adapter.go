@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
@@ -33,6 +36,29 @@ type ServiceOptions struct {
 	Capabilities inference.Capabilities
 }
 
+type readinessState struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (s *readinessState) setError(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.mu.Lock()
+	s.err = err
+	s.mu.Unlock()
+}
+
+func (s *readinessState) error() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
 // Adapter translates Bablo inference values to the pinned CPA SDK.
 type Adapter struct {
 	manager      *coreauth.Manager
@@ -40,11 +66,15 @@ type Adapter struct {
 	providers    []string
 	capabilities inference.Capabilities
 
-	mu      sync.Mutex
-	started bool
-	closed  bool
-	cancel  context.CancelFunc
-	runDone chan error
+	mu            sync.Mutex
+	started       bool
+	closed        bool
+	cancel        context.CancelFunc
+	runDone       chan struct{}
+	runErr        error
+	ready         chan struct{}
+	startup       *readinessState
+	startupCancel context.CancelFunc
 }
 
 // New constructs a manager-backed adapter. Service construction is available via NewService.
@@ -53,7 +83,8 @@ func New(opts Options) *Adapter {
 }
 
 // NewService constructs an adapter and CPA Service from a CPA config file.
-// The config path is required by the pinned CPA Builder API.
+// The embedded CPA HTTP endpoint is lifecycle-internal; Bablo remains the
+// public HTTP surface and PostgreSQL remains the credential source of truth.
 func NewService(opts ServiceOptions) (*Adapter, error) {
 	path := strings.TrimSpace(opts.ConfigPath)
 	if path == "" {
@@ -63,32 +94,164 @@ func NewService(opts ServiceOptions) (*Adapter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cpa adapter: load config: %w", err)
 	}
-
+	if err := validateEmbeddedConfig(cfg); err != nil {
+		return nil, err
+	}
+	if err := validateCredentialSourceConfig(cfg); err != nil {
+		return nil, err
+	}
+	if err := ensureEmbeddedPort(cfg); err != nil {
+		return nil, err
+	}
 	tokenStore := auth.GetTokenStore()
 	if setter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
 		setter.SetBaseDir(cfg.AuthDir)
 	}
-	manager := coreauth.NewManager(tokenStore, nil, nil)
+	// A nil CPA Store is intentional. Bablo registers decrypted runtime
+	// credentials from PostgreSQL and must not let CPA Load overwrite them from
+	// auth files or persist refreshed secrets outside Bablo's encrypted store.
+	manager := coreauth.NewManager(nil, nil, nil)
+	startupCtx, startupCancel := context.WithCancel(context.Background())
+	ready := make(chan struct{})
+	startup := &readinessState{}
+	var readyOnce sync.Once
+	startupResult := make(chan error, 1)
 	service, err := cliproxy.NewBuilder().
 		WithConfig(cfg).
 		WithConfigPath(path).
 		WithCoreAuthManager(manager).
+		// The callback is synchronous and runs before CPA creates its watcher.
+		// It establishes a real HTTP readiness barrier before runtime config
+		// synchronization touches the embedded Server.
+		WithWatcherFactory(func(_ string, _ string, reload func(*sdkconfig.Config)) (*cliproxy.WatcherWrapper, error) {
+			startupErr := <-startupResult
+			if startupErr != nil {
+				startup.setError(startupErr)
+			} else {
+				// This public callback is CPA's supported runtime synchronization
+				// boundary. It also binds built-in executors for current Auths.
+				reload(cfg)
+			}
+			readyOnce.Do(func() { close(ready) })
+			return nil, nil
+		}).
+		WithHooks(cliproxy.Hooks{OnAfterStart: func(*cliproxy.Service) {
+			startupResult <- waitForEmbeddedServer(startupCtx, cfg)
+		}}).
 		Build()
 	if err != nil {
+		startupCancel()
 		return nil, fmt.Errorf("cpa adapter: build service: %w", err)
 	}
-	return newWithManager(manager, service, opts.Providers, opts.Capabilities), nil
+	adapter := newWithManager(manager, service, opts.Providers, opts.Capabilities)
+	adapter.ready = ready
+	adapter.startup = startup
+	adapter.startupCancel = startupCancel
+	return adapter, nil
+}
+
+func ensureEmbeddedPort(cfg *sdkconfig.Config) error {
+	if cfg == nil {
+		return errors.New("cpa adapter: service config is nil")
+	}
+	if cfg.Port > 0 {
+		return nil
+	}
+	if cfg.Port < 0 {
+		return errors.New("cpa adapter: embedded service port is invalid")
+	}
+	listener, err := net.Listen("tcp", net.JoinHostPort(strings.TrimSpace(cfg.Host), "0"))
+	if err != nil {
+		return fmt.Errorf("cpa adapter: allocate embedded service port: %w", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		return fmt.Errorf("cpa adapter: release embedded service port: %w", err)
+	}
+	cfg.Port = port
+	return nil
+}
+
+func waitForEmbeddedServer(ctx context.Context, cfg *sdkconfig.Config) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cfg == nil {
+		return errors.New("cpa adapter: service config is nil")
+	}
+	address := net.JoinHostPort(strings.TrimSpace(cfg.Host), strconv.Itoa(cfg.Port))
+	endpoint := "http://" + address + "/healthz"
+	deadline := time.Now().Add(5 * time.Second)
+	client := &http.Client{Timeout: 200 * time.Millisecond}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err == nil {
+			response, requestErr := client.Do(request)
+			if requestErr == nil {
+				_ = response.Body.Close()
+				if response.StatusCode == http.StatusOK {
+					return nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("cpa adapter: embedded service did not become ready at %s", endpoint)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func validateEmbeddedConfig(cfg *sdkconfig.Config) error {
+	if cfg == nil {
+		return errors.New("cpa adapter: service config is nil")
+	}
+	switch strings.TrimSpace(cfg.Host) {
+	case "127.0.0.1", "::1":
+	default:
+		return errors.New("cpa adapter: embedded service host must be loopback")
+	}
+	if strings.TrimSpace(cfg.RemoteManagement.SecretKey) != "" {
+		return errors.New("cpa adapter: CPA management secret must be disabled")
+	}
+	if cfg.RemoteManagement.AllowRemote {
+		return errors.New("cpa adapter: remote management must be disabled")
+	}
+	return nil
+}
+
+func validateCredentialSourceConfig(cfg *sdkconfig.Config) error {
+	if cfg == nil {
+		return errors.New("cpa adapter: service config is nil")
+	}
+	if len(cfg.APIKeys) > 0 || len(cfg.GeminiKey) > 0 || len(cfg.InteractionsKey) > 0 || len(cfg.CodexKey) > 0 || len(cfg.XAIKey) > 0 || len(cfg.ClaudeKey) > 0 || len(cfg.VertexCompatAPIKey) > 0 {
+		return errors.New("cpa adapter: upstream credentials must be managed by Bablo PostgreSQL, not CPA config")
+	}
+	for index := range cfg.OpenAICompatibility {
+		if len(cfg.OpenAICompatibility[index].APIKeyEntries) > 0 {
+			return errors.New("cpa adapter: OpenAI-compatible credentials must be managed by Bablo PostgreSQL, not CPA config")
+		}
+	}
+	return nil
 }
 
 func newWithManager(manager *coreauth.Manager, service *cliproxy.Service, providers []string, capabilities inference.Capabilities) *Adapter {
-	if manager == nil {
-		manager = coreauth.NewManager(nil, nil, nil)
+	ready := make(chan struct{})
+	if service == nil {
+		close(ready)
 	}
 	return &Adapter{
 		manager:      manager,
 		service:      service,
 		providers:    append([]string(nil), providers...),
 		capabilities: cloneCapabilities(capabilities),
+		ready:        ready,
 	}
 }
 
@@ -139,12 +302,15 @@ func (a *Adapter) Start(ctx context.Context) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	a.cancel = cancel
-	a.runDone = make(chan error, 1)
+	a.runDone = make(chan struct{})
 	done := a.runDone
 	service := a.service
 	go func() {
 		err := service.Run(runCtx)
-		done <- err
+		a.mu.Lock()
+		a.runErr = err
+		close(done)
+		a.mu.Unlock()
 	}()
 	return nil
 }
@@ -165,33 +331,85 @@ func (a *Adapter) Shutdown(ctx context.Context) error {
 	}
 	a.closed = true
 	cancel := a.cancel
+	startupCancel := a.startupCancel
 	runDone := a.runDone
 	service := a.service
 	a.cancel = nil
+	a.startupCancel = nil
 	a.mu.Unlock()
 
+	if startupCancel != nil {
+		startupCancel()
+	}
 	if cancel != nil {
 		cancel()
 	}
-	a.manager.StopAutoRefresh()
 
 	var shutdownErr error
-	if service != nil {
-		shutdownErr = service.Shutdown(ctx)
-	}
 	if runDone != nil {
+		// CPA's public OnAfterStart hook fires before its watcher and refresh
+		// setup completes. Cancelling Run and waiting for it to unwind keeps
+		// the SDK's own startup/shutdown sequence serialized.
 		select {
-		case err := <-runDone:
-			if err != nil && !errors.Is(err, context.Canceled) && shutdownErr == nil {
-				shutdownErr = err
+		case <-runDone:
+			a.mu.Lock()
+			runErr := a.runErr
+			a.mu.Unlock()
+			if runErr != nil && !errors.Is(runErr, context.Canceled) && shutdownErr == nil {
+				shutdownErr = runErr
 			}
 		case <-ctx.Done():
-			if shutdownErr == nil {
-				shutdownErr = ctx.Err()
-			}
+			shutdownErr = ctx.Err()
 		}
+	} else if service != nil {
+		// Start was never called, so no SDK Run goroutine can race this call.
+		shutdownErr = service.Shutdown(ctx)
+	}
+	if a.manager != nil {
+		a.manager.StopAutoRefresh()
 	}
 	return shutdownErr
+}
+
+// WaitReady waits until the embedded CPA lifecycle reaches its public
+// OnAfterStart hook. Manager-only adapters are ready immediately.
+func (a *Adapter) WaitReady(ctx context.Context) error {
+	if a == nil {
+		return errors.New("cpa adapter: adapter is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.mu.Lock()
+	service := a.service
+	started := a.started
+	ready := a.ready
+	runDone := a.runDone
+	startup := a.startup
+	a.mu.Unlock()
+	if service == nil {
+		return nil
+	}
+	if !started || ready == nil || runDone == nil {
+		return errors.New("cpa adapter: service has not started")
+	}
+	select {
+	case <-ready:
+		if startupErr := startup.error(); startupErr != nil {
+			return fmt.Errorf("cpa adapter: service startup failed: %w", startupErr)
+		}
+		return nil
+	case <-runDone:
+		a.mu.Lock()
+		runErr := a.runErr
+		a.mu.Unlock()
+		if runErr == nil {
+			return errors.New("cpa adapter: service stopped before readiness")
+		}
+		return fmt.Errorf("cpa adapter: service stopped before readiness: %w", runErr)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Execute executes one non-streaming request through CPA core auth Manager.

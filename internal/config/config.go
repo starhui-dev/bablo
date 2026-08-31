@@ -9,12 +9,13 @@ import (
 	"time"
 )
 
-// Config contains process configuration. Secret-bearing URLs are never logged.
+// Config contains non-secret Bablo process configuration. Secret-bearing URLs are never logged.
 type Config struct {
 	Environment       string
 	HTTPAddr          string
 	DatabaseURL       string
 	RedisURL          string
+	CPAConfigPath     string
 	LogLevel          slog.Level
 	ReadHeaderTimeout time.Duration
 	ReadTimeout       time.Duration
@@ -50,12 +51,12 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-
 	return Config{
 		Environment:       envOr("BABLO_ENV", "development"),
 		HTTPAddr:          envOr("BABLO_HTTP_ADDR", ":8080"),
 		DatabaseURL:       os.Getenv("BABLO_DATABASE_URL"),
 		RedisURL:          os.Getenv("BABLO_REDIS_URL"),
+		CPAConfigPath:     strings.TrimSpace(os.Getenv("BABLO_CPA_CONFIG_PATH")),
 		LogLevel:          level,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,

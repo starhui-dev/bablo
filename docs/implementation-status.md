@@ -1,14 +1,14 @@
 # Bablo 实施状态
 
 > 最后更新：2026-08-31
-> 本次工作：完成 `bablo-scheduler` 的硬过滤、确定性策略、TTL 协调器、Decision Log、配额新鲜度/重置和并发集成验证；Route 仍只负责产出 snapshot，下一阶段由 `bablo-proxy` 消费 Scheduler。
+> 本次工作：完成 `bablo-proxy` 的 API Key -> model entitlement -> route snapshot -> Scheduler -> CPA Adapter 数据面接线；验证 `/v1/models`、Chat/Responses JSON、SSE、取消、错误映射和租约/健康反馈；下一阶段进入 `bablo-usage`。
 
 ## 1. 仓库审计结果
 
 | 项目 | 观察结果 | 证据/影响 |
 |---|---|---|
 | 根目录 | `.omp/`、`docs/`、Go/Vue bootstrap 文件 | 保留既有提示词与规划文档，新增实现文件 |
-| 后端 | 已建立 Go bootstrap、CPA adapter、data layer、`internal/auth`、`internal/apikey`、`internal/model`、`internal/provider`、`internal/pricing`、`internal/credential`、`internal/route` 与共享 `internal/audit`；`cmd/bablo` 已接线用户模型目录、管理员 catalog、Credential 和 Route API | Web Session 只保护管理面；admin catalog 强制 RBAC/MFA/CSRF；CPA 仍只在 adapter 边界 import |
+| 后端 | 已建立 Go bootstrap、CPA adapter、data layer、`internal/auth`、`internal/apikey`、`internal/model`、`internal/provider`、`internal/pricing`、`internal/credential`、`internal/route`、`internal/scheduler`、`internal/proxy` 与共享 `internal/audit`；`cmd/bablo` 已接线用户模型目录、管理员 catalog、Credential、Route、Scheduler、CPA runtime reconcile 和推理数据面 API | Web Session 只保护管理面；admin catalog 强制 RBAC/MFA/CSRF；CPA 仍只在 adapter 边界 import |
 | 前端 | Vue 登录页已接通 Session/MFA 登录、CSRF header、路由守卫和退出；模型/Key/Credential 管理 UI 留到后续前端阶段 | 当前目录 HTTP API 已可供后续 UI 使用，Dashboard/404 仍为业务壳 |
 | 数据库 | 已落地 `000001`–`000009` migrations；`000008_route_integrity.sql` 增加 Route 约束，`000009_scheduler_integrity.sql` 增加 Credential 并发容量和 Scheduler 选择归属约束 | `cmd/bablo-migrate` 显式执行 up/down；应用启动不自动改 schema；migration 测试已升级至 v9 |
 | 文档 | 架构规划、ADR、README、LICENSE、CPA compatibility 证据均已存在 | API/data/security/architecture/status 已同步模型目录与 Credential 实际契约 |
@@ -60,7 +60,7 @@
 | 8 | `bablo-credentials` | provider/model policy | 完成：AEAD secret/key rotation、状态/health/pool metadata；不泄漏 token |
 | 9 | `bablo-router` | models/credentials/policy | 完成：P0 exact 多 target、immutable version snapshot、preview、正确解析 provider model/pool target |
 | 10 | `bablo-scheduler` | 完成 | target/member 硬过滤、RR/weighted/fill/quota 策略、TTL lease/cursor/affinity、Decision Log、并发/race/fuzz |
-| 11 | `bablo-proxy` | CPA adapter + scheduler | `/v1/models`、Chat、Responses；JSON/SSE、cancel、首包前后错误、request ID |
+| 11 | `bablo-proxy` | 完成（真实 Provider/OAuth E2E 后置） | `/v1/models`、Chat、Responses；JSON/SSE、cancel、首包前后错误、request ID、header allowlist、Scheduler lease/health feedback |
 | 12 | `bablo-usage` | proxy execution facts | immutable UsageEvent、settlement key、stream cancel/no-usage/reconcile/outbox 测试 |
 | 13 | `bablo-billing` | usage/pricing/wallet schema | reservation/charge/release、price snapshot、并发 100+、重复 settle、无非法透支 |
 | 14 | `bablo-payment` | payment business decision + provider docs | order state machine、验签 fixture、金额/币种/防重放/幂等；无真实凭据则 NO-GO |
@@ -96,10 +96,10 @@
 ## 7. 下一阶段
 
 ```text
-/bablo-proxy
+/bablo-usage
 ```
 
-`bablo-scheduler` 已完成 Route snapshot 到具体 Credential 的确定性选择、Redis/内存 TTL 协调和 immutable Decision Log；下一步把 API Key entitlement、Route、Scheduler、Credential runtime 与 CPA adapter 串入 `/v1/models`、Chat Completions 和 Responses 数据面。
+`bablo-proxy` 已把 API Key entitlement、Route immutable snapshot、Scheduler credential lease、CPA runtime credential 与 `/v1/models`、Chat Completions、Responses 串通；下一步记录不可变 UsageEvent、stream/cancel 结算事实和 reconcile/outbox。
 
 ## 8. Bootstrap 验收与验证证据
 
@@ -118,7 +118,7 @@
 - `internal/inference/cpa` 实现 config load、Builder/Service lifecycle、Manager execute/stream、source/response format、request ID、provider/pinned credential、safe error 和 stream headers/cancel 映射；
 - fake provider 覆盖 non-stream、stream、401/429/5xx、caller cancel、stream close、request ID、credential pin、capability copy、service build/shutdown；
 - `go test -count=1 ./...` 通过；`go test -race -count=1 ./internal/inference/cpa` 通过；`go vet ./...` 通过；`go build -trimpath -o bin/bablo ./cmd/bablo` 通过；
-- CPA import 搜索确认源码 import 只存在于 `internal/inference/cpa/**`；真实 Provider/OAuth、Chat/Responses golden、首包后错误/failover 留到 credentials/proxy 阶段，当前不能宣称真实上游兼容。
+- CPA import 搜索确认源码 import 只存在于 `internal/inference/cpa/**`；真实 Provider/OAuth、Chat/Responses provider golden、上游首包后错误/failover 仍待真实兼容环境验证，不能把 fake contract 当作真实上游兼容。
 
 ## 10. Data Layer 验收与验证证据
 
@@ -164,7 +164,7 @@
 - 管理 API 已接线 model/provider/provider-model collection 的 GET/POST、resource GET/PATCH、Provider reconcile 和 price create/get/activate/retire；统一通过 `ProtectRole(..., "admin")` 执行 Session、CSRF、admin RBAC 和生产 MFA，普通登录用户只能读取 `/api/v1/models`；所有写入同事务写 sanitized audit；
 - 真实 PostgreSQL 17-alpine 集成测试覆盖 alias promotion/冲突、discovery pending/approve/missing/no-overwrite、能力子集、模型能力收窄拒绝、缺价拒绝、Provider 级价格优先级、published mutation 55000、重叠区间拒绝、retired 历史解析与 replacement cutover；HTTP 端到端覆盖普通用户 403、管理员 model/provider/reconcile/approve/price activate 全链路；
 - 完整验证：真实 PostgreSQL 下 `go test -count=1 ./...`、`go test -race -count=1 ./internal/model ./internal/provider ./internal/pricing ./internal/auth ./internal/httpapi ./cmd/bablo`、`go vet ./...`、两个 Go binary build 全部通过；追加能力约束后 `go test -race -count=1 ./internal/model ./internal/provider ./internal/pricing` 通过；前端 `pnpm lint/typecheck/test/build` 通过；实际 `bablo` 进程 smoke 验证 `/healthz` 200、`/api/v1/models` 和 `/api/v1/admin/models` 未登录均 401；
-- 当前限制：CPA model registry 尚未接入自动 poller，reconcile 入口接受未来内部 worker 的完整发现快照；Route 已实现但尚未被 proxy 数据面消费；真实价格表/币种/商业策略仍由业务提供，缺失保持 fail closed；Scheduler 已实现但整体推理、usage/billing 和真实上游仍未接通；下一阶段进入 `bablo-proxy`。
+- 当前限制：CPA model registry 尚未接入自动 poller，reconcile 入口接受未来内部 worker 的完整发现快照；Route 已被 Proxy 数据面消费；真实价格表/币种/商业策略仍由业务提供，缺失保持 fail closed；Usage/Billing、真实上游和预算消费门禁仍未接通，下一阶段进入 `bablo-usage`。
 
 ## 14. Credentials 验收与验证证据
 
@@ -176,7 +176,7 @@
 - CPA runtime bridge 使用锁定 `v7.2.145` 的公开 `sdk/cliproxy/auth`，映射为 `runtime_only=true` 的 CPA auth；PostgreSQL 仍是事实源，CPA runtime store 不回写业务 secret；Remove 只清理运行时状态。
 - 真实 PostgreSQL 17-alpine 集成测试覆盖 secret ciphertext/非泄漏、AAD/key rotation、secret rotate/reencrypt、health monotonicity、Provider pool 归属、复合游标分页和 12 路并发 rotate；HTTP 端到端覆盖管理员 create/health 与统一路由挂载；CPA 单测覆盖 OAuth/API key runtime mapping 和 unsupported source 清理。
 - 验证命令及结果：`BABLO_TEST_DATABASE_URL=... go test -count=1 ./...` 通过（13 packages、4 no-test packages）；`go test -race -count=1 ./internal/credential ./internal/inference/cpa ./internal/config ./internal/httpapi ./cmd/bablo` 通过；`go vet ./...`、`go build -trimpath -o /tmp/bablo-credential-final ./cmd/bablo`、`docker compose --env-file .env.example -f deploy/compose.dev.yaml config --quiet` 通过；前端 `pnpm --dir web lint/typecheck/test/build` 通过。
-- 当前限制：真实 OAuth refresh/provider executor E2E、credential 启动时从 PostgreSQL reconcile 到 CPA Manager 的主程序 wiring、proxy 调用 Scheduler、管理员 Credential UI、Redis/HA keyring reload 尚未实现或验证；这些不阻塞本地 Credential store，但阻塞整体生产 GO。
+- 当前限制：真实 OAuth refresh/provider executor E2E、Credential 变更后的运行时热同步、CPA refresh token 回写 PostgreSQL、管理员 Credential UI、Redis/HA keyring reload 尚未实现或验证；启动时从 PostgreSQL reconcile 到 CPA Manager 已由 `cmd/bablo` 接线，但不能替代变更事件同步；这些仍阻塞整体生产 GO。
 
 ## 15. Router 验收与验证证据
 
@@ -184,7 +184,7 @@
 - `route_versions` 只允许旧 active version 一次性写入 `effective_to`；`route_targets` 不允许 UPDATE/DELETE；snapshot hash 为 SHA-256，Route 配置修改只能发布新 version。
 - 管理 API 已接线：`GET/POST /api/v1/admin/routes`、`GET/PATCH /api/v1/admin/routes/{id}`、`GET/POST /api/v1/admin/routes/{id}/versions`、`GET /api/v1/admin/routes/preview?model=...`；preview 不执行 Scheduler、Credential 解密或上游请求，数据面仍须先完成 API Key entitlement。
 - 真实 PostgreSQL 17-alpine 集成测试覆盖 alias resolve、multi-target snapshot、version publish/历史、cross-provider target rejection、disabled route 和两路并发 publish；HTTP 端到端覆盖 admin create、preview、publish、version list 与统一路由挂载。
-- 当前限制：Route 只产生 candidates，不执行 Credential 选择；prefix/regex、真实推理请求和一 Key 多模型完整数据面 E2E 留到后续阶段。
+- 当前限制：Route 包仍只产生 candidates；prefix/regex、真实推理请求由 Proxy 消费，完整真实上游 E2E 与一 Key 多模型数据面 E2E 仍待后续验证。
 
 ## 16. Scheduler 验收与验证证据
 
@@ -192,5 +192,18 @@
 - 默认 `round_robin` 使用 PostgreSQL route version + strategy + priority 的稳定 cursor；同时提供显式 `weighted_round_robin`、`fill_first`、`quota_aware` 和有限 affinity。没有隐式随机；affinity 不能绕过硬过滤，失效会写 `affinity_unavailable`。
 - Redis 协调器使用 `SET NX PX` owner-token lease、Lua 原子 release/renew/cursor、TTL affinity；内存实现只用于 P0 单实例和测试。Redis 错误不会被当成可用容量，避免并发超卖。
 - 每次成功/失败选择都写 immutable `scheduler_decisions`，保存候选、排除原因、selected target/provider/credential、fallback chain 和 strategy version；`000009_scheduler_integrity.sql` 以数据库约束和 trigger 校验选择归属。
-- 验证命令及结果：`go test -count=1 ./...` 通过（15 packages、4 no-test packages，临时 PostgreSQL 17-alpine + Redis 8-alpine）；`go test -race -count=1 ./internal/scheduler`、`go vet ./...`、两个 Go binary build 和 Compose config 通过；`go test -fuzz=FuzzWeightedStartStaysWithinCandidates -fuzztime=3s ./internal/scheduler` 与 `go test -fuzz=FuzzUnavailableCredentialIsAlwaysRejected -fuzztime=3s ./internal/scheduler` 均通过。覆盖 disabled/revoked、429 cooldown、priority/RR/weighted/fill/quota、quota stale/reset、affinity failover、Decision Log append-only、双 Service 并发容量和 Redis 两实例共享 lease/cursor/affinity。
-- 当前限制：Scheduler 尚未接入 proxy 请求流水线、quota poller、真实 Provider health/429 feedback、管理员 Decision 查询 API；这些由后续 proxy/quota/stats 阶段完成，整体生产仍 NO-GO。
+- 验证命令及结果：`go test -count=1 ./...`（无外部测试环境）通过；本次使用本机 PostgreSQL/Redis 测试实例执行 `go test -p 1 -race ./... -count=1`，16 packages 通过；`go vet ./...`、`go build -trimpath -o /tmp/bablo-proxy-verify ./cmd/bablo`、迁移二进制构建和前端 lint/typecheck/test/build 通过。并行运行带共享 PostgreSQL 的全套集成测试曾因连接/迁移锁竞争触发 Route 测试 30 秒 context deadline，串行 `-p 1` 通过，CI 应显式控制数据库连接容量或测试并发。
+- 当前限制：quota poller、真实 Provider health/429 feedback 和管理员 Decision 查询 API 仍未完成；Proxy 已消费 Scheduler，但 Usage/Billing 尚未接入，因此预算消费、UsageEvent、Wallet 结算和整体生产仍 NO-GO。
+
+## 17. Proxy 验收与验证证据
+
+- `internal/proxy` 已实现 `GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`；请求按 request ID、API Key 身份、canonical model entitlement、immutable Route resolution、Scheduler selection/lease、CPA Engine 执行顺序处理。
+- `/v1/models` 使用当前 Key 的 fresh authorization 结果跨页筛选 public model；不会返回其他租户模型或 Credential 信息。Chat/Responses 仅把 public model/alias 解析为 canonical model，再把实际 provider slug、upstream model、route version、credential ID 传给 inference adapter。
+- JSON 响应拒绝空/非 JSON/非 2xx 上游结果；SSE 覆盖 raw JSON framing、已有 SSE 保留、Chat `[DONE]`、Responses terminal event、首包前 JSON 错误、首包后结构化 SSE 错误、上游断流和客户端取消。首个 payload 后不透明 fallback。
+- 请求 Authorization、Cookie、Forwarded、连接控制和客户端 request ID 不转发；响应只 allowlist content type、rate-limit、retry-after 等安全 header，JSON/SSE 均由 Bablo 强制 `Cache-Control: no-store`；客户端取消不写入 Credential failure health，非取消错误会记录安全分类/cooldown 并释放 concurrency lease。
+- 请求向 CPA 只转发显式 allowlist（Content-Type、Accept、User-Agent、trace context 和已审计协议头）；Authorization、Cookie、Forwarded、任意 X-* 客户端头和连接控制头全部剥离，并统一注入服务端 request ID。
+- `cmd/bablo` 在 CPA 启动前从 Credential service 执行 PostgreSQL runtime reconcile，CPA ready 后才挂载 Proxy；CPA config 含 credential-bearing 字段或 `remote-management.secret-key` 时 fail closed，防止配置文件成为第二事实源或开启嵌入式管理面。
+- Proxy fake-engine contract tests 覆盖 Chat/Responses JSON、模型列表、Scheduler request/protocol/capability、credential pin、请求/响应 header allowlist、首包前后错误、断流、取消、租约释放和健康反馈；`go test -race ./internal/proxy -count=1` 通过。
+- CPA adapter 现在拒绝非 loopback/远程管理、`remote-management.secret-key` 和配置内上游凭据；管理面配置回归测试已覆盖，避免嵌入式 CPA 管理 API 或配置文件成为旁路入口。
+- 本次最终验证：`go test -p 1 -race ./... -count=1`（16 packages 通过、4 no-test packages）、`go vet ./...`、`go build -trimpath -o /tmp/bablo-proxy-final3 ./cmd/bablo` 全部通过；共享 PostgreSQL 测试按 `-p 1` 串行执行以避免迁移/连接池竞争。
+- 尚未宣称真实 Provider/OAuth 协议兼容：CPA 的真实上游、refresh、usage 采集、流式 provider golden、首包后上游行为和支付都需后续环境/凭据与 `bablo-usage`/`bablo-payment` 阶段验证。

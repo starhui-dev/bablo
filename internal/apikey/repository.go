@@ -583,6 +583,72 @@ func (r *Repository) authorizeModel(ctx context.Context, keyID, userID uuid.UUID
 	return allowed || defaultAllow, nil
 }
 
+func (r *Repository) listAuthorizedModels(ctx context.Context, keyID, userID uuid.UUID, secretVersion int64, now time.Time) ([]string, error) {
+	var keyValid bool
+	if err := r.store.Queryer().QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM api_keys
+			JOIN users ON users.id = api_keys.user_id
+			WHERE api_keys.id = $1
+			  AND api_keys.user_id = $2
+			  AND api_keys.secret_version = $3
+			  AND api_keys.status = 'active'
+			  AND (api_keys.expires_at IS NULL OR api_keys.expires_at > $4)
+			  AND users.status = 'active' AND users.deleted_at IS NULL
+		)`, keyID, userID, secretVersion, now).Scan(&keyValid); err != nil {
+		return nil, fmt.Errorf("validate API key for model list: %w", err)
+	}
+	if !keyValid {
+		return nil, ErrInvalidKey
+	}
+	rows, err := r.store.Queryer().Query(ctx, `
+		SELECT m.public_model_id
+		FROM models m
+		WHERE m.enabled AND m.visibility = 'public' AND m.deleted_at IS NULL
+		  AND EXISTS (
+			SELECT 1
+			FROM api_key_policies assignment
+			JOIN policies policy ON policy.id = assignment.policy_id
+			WHERE assignment.api_key_id = $1
+			  AND (
+				policy.default_action = 'allow'
+				OR EXISTS (
+					SELECT 1
+					FROM policy_model_entitlements allow_entitlement
+					WHERE allow_entitlement.policy_id = policy.id
+					  AND allow_entitlement.model_id = m.id
+					  AND allow_entitlement.effect = 'allow'
+				)
+			  )
+		  )
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM api_key_policies denied_assignment
+			JOIN policy_model_entitlements denied_entitlement ON denied_entitlement.policy_id = denied_assignment.policy_id
+			WHERE denied_assignment.api_key_id = $1
+			  AND denied_entitlement.model_id = m.id
+			  AND denied_entitlement.effect = 'deny'
+		  )
+		ORDER BY m.public_model_id`, keyID)
+	if err != nil {
+		return nil, fmt.Errorf("list authorized API key models: %w", err)
+	}
+	defer rows.Close()
+	models := make([]string, 0)
+	for rows.Next() {
+		var publicID string
+		if err := rows.Scan(&publicID); err != nil {
+			return nil, fmt.Errorf("scan authorized API key model: %w", err)
+		}
+		models = append(models, publicID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate authorized API key models: %w", err)
+	}
+	return models, nil
+}
+
 func (r *Repository) touchLastUsed(ctx context.Context, keyID uuid.UUID, now time.Time) {
 	_, _ = r.store.Queryer().Exec(ctx, `
 		UPDATE api_keys

@@ -1,8 +1,8 @@
 # Bablo 安全模型
 
 > 目标：生产级多用户 AI Gateway 的控制面、推理面和账务安全基线
-> 日期：2026-08-30
-> 当前状态：P0 Web Session、CSRF、RBAC、管理员 TOTP/恢复码、推理 API Key 与上游 Credential AEAD/轮换已实现；route/proxy、支付和生产安全门禁仍按后续阶段落地。
+> 日期：2026-08-31
+> 当前状态：P0 Web Session、CSRF、RBAC、管理员 TOTP/恢复码、推理 API Key、上游 Credential AEAD/轮换、Route/Scheduler/Proxy 数据面已实现；真实上游、Usage/支付和生产安全门禁仍未放行。
 
 ## 1. 资产与信任边界
 
@@ -59,6 +59,7 @@
 - Provider endpoint、proxy URL、region、management URL 只允许配置层受控字段；解析后拒绝 loopback、link-local、RFC1918、云 metadata、Unix socket、非允许 scheme/端口，除非显式内部 allowlist；
 - 禁止用户通过请求字段选择任意 URL、任意 proxy 或 CPA management；HTTP client 禁止跟随不受控跨协议重定向，重新校验每次 redirect；
 - 统一 timeout、最大 body、连接池和响应 header allowlist；拒绝 CRLF/header injection；
+- Proxy 到 CPA 只允许经过审计的协议/trace header，并剥离 Authorization、Cookie、Forwarded、任意客户端 `X-*` 和连接控制头；推理 JSON/SSE 响应强制 `Cache-Control: no-store`。
 - route preview 与真实执行复用同一 policy/entitlement 逻辑；route snapshot 固定后不受后台修改影响；
 - Provider/resource type 明确区分 `official_api`、`enterprise_api`、`subscription`、`third_party`；`subscription` 默认 `commercial_allowed=false`，未作出业务/条款决定不得公开商业转售；
 - OAuth/上游 401 不按普通 429 无限重试，credential 进入需要人工/刷新处理的状态。

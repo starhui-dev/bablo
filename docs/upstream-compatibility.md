@@ -1,7 +1,7 @@
 # CPA Upstream Compatibility
 
-> 核验日期：2026-08-29
-> 结论：已锁定并编译验证 `v7.2.145`；Bablo adapter 已落盘，真实上游凭据与协议 E2E 仍未验证。
+> 核验日期：2026-08-31（版本事实首次核验：2026-08-29）
+> 结论：已锁定并编译验证 `v7.2.145`；Bablo adapter、runtime credential reconcile 和 Proxy fake contract 已验证，真实上游凭据与协议 E2E 仍未验证。
 
 ## 1. 版本事实与来源
 
@@ -116,6 +116,7 @@ sdk/translator/builtin
 4. adapter 负责能力快照、协议格式/请求头/路由凭据映射、stream/cancel、safe error classification、request ID metadata/header 传播；credential 主数据仍由 Bablo PostgreSQL 管理。
 5. CPA usage manager/queue 只作为观测或 reconcile signal，不直接入账；如 CPA 需要 runtime artifact，由 Bablo 状态生成，不把 CPA 文件反向当事实源。
 6. 禁止 import CPA `internal/*`。如果公开 API 无法满足 credential/runtime 需求，先写 ADR 并选择公开 SDK、受控 loopback 或暂时将能力标为 NO-GO，而不是越界。
+7. CPA 配置文件只能承载 loopback 服务端点、模型/协议元数据等非凭据配置；`api-keys`、Provider API key、OAuth/refresh token、OpenAI-compatible `api-key-entries` 和 `remote-management.secret-key` 一律不允许由 Bablo adapter 接管，相关业务凭据必须由 Bablo PostgreSQL Credential service 管理。adapter 在启动前拒绝这些字段，防止 CPA 文件成为第二事实源或开启嵌入式管理面。
 
 ## 6. 首次集成验证清单
 
@@ -123,11 +124,11 @@ sdk/translator/builtin
 - [x] adapter 编译契约锁定六个 `ProviderExecutor` 方法，且只在 `internal/inference/cpa` 使用 CPA import；
 - [x] fake provider 覆盖 non-stream/stream、stream headers/close、429/401/5xx、cancel、request ID、pinned credential、service build/shutdown；
 - [x] translator public format mapping 覆盖 OpenAI Responses、Claude；
-- [x] empty stream 已在 adapter 层拒绝；首包前后错误、partial output 后不 failover 仍需真实 proxy/上游协议阶段补齐；
-- [x] Credential runtime mapping/reconcile 使用公开 `sdk/cliproxy/auth`；API key/OAuth secret 仅在 runtime `Auth` 中存在，`runtime_only`/source backend 防止 CPA persist 回写；真实 upstream OAuth refresh 仍待后续 proxy 阶段。
-- [ ] credential refresh/cooldown/fallback 与 Bablo scheduler decision；CPA Manager 基础能力已核验，领域调度尚未实现；
-- [ ] 一个 Key 访问多个模型的端到端测试；依赖 apikey/models/router/proxy 阶段；
-- [ ] CPA tag 升级跑 compatibility + regression + race；当前仅完成锁定版本回归与 race；
+- [x] empty stream 已在 adapter 层拒绝；Proxy 已补齐首包前后错误、partial output 后不 failover、客户端 cancel、SSE terminal/error framing 和安全 header 传播的 fake contract；真实上游行为仍需 E2E。
+- [x] Credential runtime mapping/reconcile 使用公开 `sdk/cliproxy/auth`；API key/OAuth secret 仅在 runtime `Auth` 中存在，`runtime_only`/source backend 防止 CPA persist 回写；真实 upstream OAuth refresh 仍待真实兼容环境与 provider 凭据验证。
+- [x] credential cooldown/fallback 与 Bablo scheduler decision 已由 `internal/scheduler` 和 Proxy feedback 接通；quota poller、真实 Provider health/429 feedback 仍未完成。
+- [ ] 一个 Key 访问多个模型的真实 PostgreSQL + CPA upstream 端到端测试；fake engine contract 已覆盖多模型授权路径。
+- [ ] CPA tag 升级跑 compatibility + regression + race；当前仅完成锁定版本回归与 race。
 - [x] 实际 import 列表、符号、编译命令和结果已记录如下。
 
 ## 7. 本次 adapter 实现证据
@@ -156,4 +157,4 @@ sdk/cliproxy/executor.RequestedModelMetadataKey / PinnedAuthMetadataKey
 sdk/translator.Format* / FromString
 ```
 
-验证命令及结果：`go test -count=1 ./...`、`go test -race -count=1 ./internal/inference/cpa`、`go vet ./...`、`go build -trimpath -o bin/bablo ./cmd/bablo` 均通过。Credential 集成额外覆盖真实 PostgreSQL secret lifecycle、key rotation、复合游标、health 和 runtime source；fake runtime source 覆盖 CPA reconcile stale cleanup。fake provider 使用空 CPA model registry 做生命周期/错误/stream contract 测试；真实模型目录、协议翻译、OAuth refresh、首包后的 failover 仍必须在 `bablo-proxy` compatibility suite 验证，不能把本阶段测试当作真实上游 E2E。
+验证命令及结果：`go test -p 1 -race ./... -count=1`（本机 PostgreSQL/Redis 测试实例）通过；`go test -race ./internal/proxy -count=1`、`go vet ./...`、`go build -trimpath -o /tmp/bablo-proxy-verify ./cmd/bablo`、迁移二进制构建和前端 lint/typecheck/test/build 通过。Credential 集成覆盖 PostgreSQL secret lifecycle、key rotation、复合游标、health 和 runtime source；Proxy fake provider/engine 覆盖模型列表、Chat/Responses、JSON/SSE、取消、错误和租约/health 反馈。并行共享数据库测试曾因迁移锁/连接竞争超时，生产兼容性门禁仍需独立数据库与真实上游凭据。

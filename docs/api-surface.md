@@ -23,7 +23,7 @@
 
 ### Streaming 契约
 
-- `stream=true` 使用 SSE，正确返回 `Content-Type`、终止事件和 request ID；
+- `stream=true` 使用 SSE，正确返回 `Content-Type`、终止事件和 request ID；JSON/SSE 响应均强制 `Cache-Control: no-store`，不接受上游覆盖；
 - 首包前上游错误返回标准 JSON error；首包后错误发送可识别的 SSE error/终止事件，不能伪造完整成功；
 - 客户端取消必须取消 context、释放 concurrency lease；若可取得 usage，仍生成 UsageEvent；无法取得时标为 reconcile-needed；
 - 首个 payload 已发出后不做透明 fallback，所有尝试和最终状态进入 request trace。
@@ -108,7 +108,7 @@ bablo auth reset-password --email user@example.com
 
 - `GET/POST/PATCH /api/v1/admin/users`
 - `GET/POST/PATCH /api/v1/admin/roles`
-- `GET /api/v1/models`：已登录用户可见的 enabled/public 模型与 canonical capabilities/aliases；推理面的 `/v1/models` 仍由 proxy 阶段实现；
+- `GET /api/v1/models`：已登录用户可见的 enabled/public 模型与 canonical capabilities/aliases；推理面的 `/v1/models` 已由 Proxy 按 API Key entitlement 返回当前 Key 可访问模型，不泄漏其他租户或 Credential。
 - `GET/POST /api/v1/admin/models`、`GET/PATCH /api/v1/admin/models/{id}`：模型目录、别名、visibility、billing class、能力和启停；
 - `GET/POST /api/v1/admin/providers`、`GET/PATCH /api/v1/admin/providers/{id}`：Provider 资源类型、商业政策和启停；subscription 在 P0 强制 `commercial_allowed=false`；
 - `GET/POST /api/v1/admin/provider-models`、`GET/PATCH /api/v1/admin/provider-models/{id}`：上游模型映射、协议、能力和审核状态；列表必须按 `provider_id` 限定；

@@ -22,7 +22,12 @@ func TestRegisterCredentialMapsRuntimeOnlyCredentialWithoutPersistence(t *testin
 		ExternalStableID: "oauth-account",
 		SourceKind:       credential.SourceOAuth,
 		Region:           "us-east-1",
-		Metadata:         map[string]string{"account_email": "owner@example.test"},
+		ProxyRef:         "http://proxy.example.test:8080",
+		Metadata: map[string]string{
+			"account_email": "owner@example.test",
+			"base_url":      "https://api.example.test/v1",
+			"provider_key":  "codex",
+		},
 		Secrets: map[string][]byte{
 			credential.SecretOAuthAccess:  []byte("access-token"),
 			credential.SecretOAuthRefresh: []byte("refresh-token"),
@@ -37,6 +42,9 @@ func TestRegisterCredentialMapsRuntimeOnlyCredentialWithoutPersistence(t *testin
 	}
 	if registered.Attributes[coreauth.AttributeRuntimeOnly] != "true" || registered.Attributes[coreauth.AttributeAuthKind] != credential.SourceOAuth || registered.Attributes[coreauth.AttributeSourceBackend] != babloCredentialSource {
 		t.Fatalf("runtime attributes = %#v", registered.Attributes)
+	}
+	if registered.Attributes["base_url"] != "https://api.example.test/v1" || registered.Attributes["provider_key"] != "codex" || registered.ProxyURL != "http://proxy.example.test:8080" {
+		t.Fatalf("runtime endpoint/proxy mapping = %#v / %q", registered.Attributes, registered.ProxyURL)
 	}
 	if registered.Metadata["access_token"] != "access-token" || registered.Metadata["refresh_token"] != "refresh-token" {
 		t.Fatal("registered OAuth token metadata does not match source")

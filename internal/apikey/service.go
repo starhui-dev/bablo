@@ -164,6 +164,14 @@ func (s *Service) Authorize(ctx context.Context, principal Principal, publicMode
 	}
 	return s.limiter.Allow(ctx, principal.APIKeyID, principal.RPMLimit, principal.TPMLimit, tokens, now)
 }
+// ListAuthorizedModels returns enabled public model IDs visible to the current key.
+// It performs a fresh key/version/status check but does not consume rate limits.
+func (s *Service) ListAuthorizedModels(ctx context.Context, principal Principal) ([]string, error) {
+	if principal.UserID == uuid.Nil || principal.APIKeyID == uuid.Nil || principal.SecretVersion <= 0 {
+		return nil, ErrInvalidInput
+	}
+	return s.repository.listAuthorizedModels(ctx, principal.APIKeyID, principal.UserID, principal.SecretVersion, s.now().UTC())
+}
 
 func (s *Service) validateCreate(input CreateInput) (CreateInput, error) {
 	name, err := normalizeName(input.Name)

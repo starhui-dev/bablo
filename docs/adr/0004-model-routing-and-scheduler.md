@@ -25,7 +25,7 @@ Scheduler 两阶段执行：
 
 Redis 只存带 TTL 的 concurrency lease、affinity、RR cursor；quota snapshot 来自带 `observed_at`/confidence 的 poller，stale/missing 按保守策略处理。所有 lease 使用 owner token finally/recovery 释放。
 
-实现于 2026-08-30：`internal/scheduler` 已按上述边界落地；`migrations/000009_scheduler_integrity.sql` 记录 resolved route/provider/credential 并校验选择归属，`credentials.max_concurrency` 定义每个 Credential 的 TTL lease 槽位数。数据面将在 `bablo-proxy` 阶段调用 Route resolver 后调用 Scheduler；当前阶段不直接执行 CPA 请求。
+- 实现于 2026-08-30：`internal/scheduler` 已按上述边界落地；`migrations/000009_scheduler_integrity.sql` 记录 resolved route/provider/credential 并校验选择归属，`credentials.max_concurrency` 定义每个 Credential 的 TTL lease 槽位数。`internal/proxy` 已在每次请求中先调用 Route resolver、再调用 Scheduler 并执行 CPA；真实上游错误/配额反馈和 Usage 结算仍由后续阶段接入。
 
 ## 后果
 

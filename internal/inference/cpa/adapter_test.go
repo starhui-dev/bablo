@@ -2,19 +2,25 @@ package cpa
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 
+	"github.com/starhui-dev/bablo/internal/credential"
 	"github.com/starhui-dev/bablo/internal/inference"
 )
 
@@ -251,6 +257,9 @@ func TestAdapterDefaultProviderAndLifecycle(t *testing.T) {
 	if err := adapter.Start(context.Background()); err != nil {
 		t.Fatalf("second Start() error = %v", err)
 	}
+	if err := adapter.WaitReady(context.Background()); err != nil {
+		t.Fatalf("WaitReady() error = %v", err)
+	}
 	req := request()
 	req.ResolvedRoute.ProviderID = ""
 	req.ResolvedRoute.CredentialID = ""
@@ -309,17 +318,103 @@ func TestAdapterStreamNextHonorsCallerCancellation(t *testing.T) {
 
 func TestNewServiceBuildsAndShutsDown(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
+	configBody := "host: 127.0.0.1\nport: 0\nauth-dir: " + filepath.Join(t.TempDir(), "auth") + "\nremote-management:\n  allow-remote: false\n"
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	adapter, err := NewService(ServiceOptions{ConfigPath: configPath})
 	if err != nil {
 		t.Fatalf("NewService() error = %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	if err := adapter.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer readyCancel()
+	if err := adapter.WaitReady(readyCtx); err != nil {
+		t.Fatalf("WaitReady() error = %v", err)
+	}
 	if err := adapter.Shutdown(ctx); err != nil {
 		t.Fatalf("Shutdown() error = %v", err)
+	}
+}
+
+func TestNewServiceExecutesRegisteredOpenAICompatibilityCredential(t *testing.T) {
+	var upstreamRequest struct {
+		Model string `json:"model"`
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer integration-key" {
+			t.Errorf("upstream authorization = %q, want bearer credential", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&upstreamRequest); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-integration","object":"chat.completion","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	authDir := filepath.Join(t.TempDir(), "auth")
+	configBody := "host: 127.0.0.1\nport: 0\nauth-dir: " + authDir + "\nremote-management:\n  allow-remote: false\nopenai-compatibility:\n  - name: local-provider\n    base-url: " + upstream.URL + "\n    models:\n      - name: upstream-model\n        alias: upstream-model\n"
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	adapter, err := NewService(ServiceOptions{ConfigPath: configPath})
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	credentialID := uuid.New()
+	if err := adapter.RegisterCredential(context.Background(), credential.RuntimeCredential{
+		CredentialID: credentialID,
+		ProviderSlug: "local-provider",
+		SourceKind:   credential.SourceAPIKey,
+		Metadata:     map[string]string{"base_url": upstream.URL},
+		Secrets:      map[string][]byte{credential.SecretAPIKey: []byte("integration-key")},
+	}); err != nil {
+		t.Fatalf("RegisterCredential() error = %v", err)
+	}
+	startCtx, startCancel := context.WithCancel(context.Background())
+	defer startCancel()
+	if err := adapter.Start(startCtx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer readyCancel()
+	if err := adapter.WaitReady(readyCtx); err != nil {
+		t.Fatalf("WaitReady() error = %v", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := adapter.Shutdown(shutdownCtx); err != nil {
+			t.Errorf("Shutdown() error = %v", err)
+		}
+	}()
+
+	result, err := adapter.Execute(context.Background(), inference.Request{
+		RequestID: "req-service-integration",
+		ResolvedRoute: inference.ResolvedRoute{
+			ProviderID:     "local-provider",
+			CredentialID:   credentialID.String(),
+			RequestedModel: "public-model",
+			ResolvedModel:  "upstream-model",
+		},
+		SourceFormat:   "openai",
+		ResponseFormat: "openai",
+		Body:           []byte(`{"model":"public-model","messages":[]}`),
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.StatusCode != http.StatusOK || !json.Valid(result.Body) {
+		t.Fatalf("result = %#v, want valid successful JSON", result)
+	}
+	if upstreamRequest.Model != "upstream-model" {
+		t.Fatalf("upstream model = %q, want upstream-model", upstreamRequest.Model)
 	}
 }
 
@@ -338,6 +433,49 @@ func TestNewServiceRejectsMissingConfig(t *testing.T) {
 	}
 }
 
+func TestNewServiceRejectsUnsafeEmbeddedNetworkConfig(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "wildcard host", body: "host: 0.0.0.0\nport: 8317\n", want: "loopback"},
+		{name: "remote management", body: "host: 127.0.0.1\nport: 8317\nremote-management:\n  allow-remote: true\n", want: "remote management"},
+		{name: "management secret", body: "host: 127.0.0.1\nport: 8317\nremote-management:\n  secret-key: local-secret\n", want: "management"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(test.body), 0o600); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			if _, err := NewService(ServiceOptions{ConfigPath: path}); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("NewService() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestNewServiceRejectsConfigCredentials(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "client api keys", body: "host: 127.0.0.1\nport: 8317\napi-keys:\n  - client-key\n", want: "upstream credentials"},
+		{name: "provider api key", body: "host: 127.0.0.1\nport: 8317\ngemini-api-key:\n  - api-key: provider-key\n", want: "upstream credentials"},
+		{name: "openai compatibility api key", body: "host: 127.0.0.1\nport: 8317\nopenai-compatibility:\n  - name: provider\n    base-url: https://upstream.example.com/v1\n    api-key-entries:\n      - api-key: provider-key\n", want: "OpenAI-compatible credentials"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(test.body), 0o600); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			if _, err := NewService(ServiceOptions{ConfigPath: path}); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("NewService() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
 func TestRequestModelUsesResolvedRoute(t *testing.T) {
 	req := inference.Request{ResolvedRoute: inference.ResolvedRoute{RequestedModel: "public", ResolvedModel: "upstream"}}
 	if got := requestModel(req); got != "upstream" {

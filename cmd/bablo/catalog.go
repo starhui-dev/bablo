@@ -15,19 +15,19 @@ import (
 	"github.com/starhui-dev/bablo/internal/secret"
 )
 
-func catalogServerOptions(store *data.Store, authHandler *auth.Handler, credentialKeys *secret.Keyring, logger *slog.Logger) ([]httpapi.Option, error) {
-	if authHandler == nil {
-		return nil, nil
-	}
+type catalogRuntime struct {
+	options           []httpapi.Option
+	modelService      *model.Service
+	routeService      *route.Service
+	credentialService *credential.Service
+}
+
+func newCatalogRuntime(store *data.Store, authHandler *auth.Handler, credentialKeys *secret.Keyring, logger *slog.Logger) (*catalogRuntime, error) {
 	modelRepository, err := model.NewRepository(store)
 	if err != nil {
 		return nil, err
 	}
 	modelService, err := model.NewService(modelRepository)
-	if err != nil {
-		return nil, err
-	}
-	modelHandler, err := model.NewHandler(modelService, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -40,20 +40,12 @@ func catalogServerOptions(store *data.Store, authHandler *auth.Handler, credenti
 	if err != nil {
 		return nil, err
 	}
-	providerHandler, err := provider.NewHandler(providerService, logger)
-	if err != nil {
-		return nil, err
-	}
 
 	pricingRepository, err := pricing.NewRepository(store)
 	if err != nil {
 		return nil, err
 	}
 	pricingService, err := pricing.NewService(pricingRepository)
-	if err != nil {
-		return nil, err
-	}
-	pricingHandler, err := pricing.NewHandler(pricingService, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -66,12 +58,11 @@ func catalogServerOptions(store *data.Store, authHandler *auth.Handler, credenti
 	if err != nil {
 		return nil, err
 	}
-	routeHandler, err := route.NewHandler(routeService, logger)
-	if err != nil {
-		return nil, err
-	}
 
-	var credentialHandler http.Handler
+	runtime := &catalogRuntime{
+		modelService: modelService,
+		routeService: routeService,
+	}
 	if credentialKeys != nil {
 		credentialRepository, err := credential.NewRepository(store, credentialKeys)
 		if err != nil {
@@ -81,7 +72,32 @@ func catalogServerOptions(store *data.Store, authHandler *auth.Handler, credenti
 		if err != nil {
 			return nil, err
 		}
-		credentialHandler, err = credential.NewHandler(credentialService, logger)
+		runtime.credentialService = credentialService
+	}
+	if authHandler == nil {
+		return runtime, nil
+	}
+
+	modelHandler, err := model.NewHandler(modelService, logger)
+	if err != nil {
+		return nil, err
+	}
+	providerHandler, err := provider.NewHandler(providerService, logger)
+	if err != nil {
+		return nil, err
+	}
+	pricingHandler, err := pricing.NewHandler(pricingService, logger)
+	if err != nil {
+		return nil, err
+	}
+	routeHandler, err := route.NewHandler(routeService, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	var credentialHandler http.Handler
+	if runtime.credentialService != nil {
+		credentialHandler, err = credential.NewHandler(runtime.credentialService, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -104,9 +120,17 @@ func catalogServerOptions(store *data.Store, authHandler *auth.Handler, credenti
 		adminCatalog.Handle("/api/v1/admin/credential-pools", credentialHandler)
 		adminCatalog.Handle("/api/v1/admin/credential-pools/", credentialHandler)
 	}
-
-	return []httpapi.Option{
+	runtime.options = []httpapi.Option{
 		httpapi.WithModelHandler(authHandler.Protect(modelHandler)),
 		httpapi.WithAdminCatalogHandler(authHandler.ProtectRole(adminCatalog, "admin")),
-	}, nil
+	}
+	return runtime, nil
+}
+
+func catalogServerOptions(store *data.Store, authHandler *auth.Handler, credentialKeys *secret.Keyring, logger *slog.Logger) ([]httpapi.Option, error) {
+	runtime, err := newCatalogRuntime(store, authHandler, credentialKeys, logger)
+	if err != nil {
+		return nil, err
+	}
+	return runtime.options, nil
 }

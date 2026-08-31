@@ -39,19 +39,35 @@ func (a *Adapter) RegisterCredential(ctx context.Context, value credential.Runti
 		return &inference.UpstreamError{Class: "credential_source_unsupported", HTTPStatus: http.StatusNotImplemented}
 	}
 
+	attributes := map[string]string{
+		auth.AttributeAuthKind:      value.SourceKind,
+		auth.AttributeRuntimeOnly:   "true",
+		auth.AttributeSource:        auth.AuthSourcePostgres,
+		auth.AttributeSourceBackend: babloCredentialSource,
+		"region":                    value.Region,
+	}
+	// OpenAI-compatible and several native CPA executors read immutable
+	// endpoint configuration from Auth.Attributes, while mutable OAuth tokens
+	// stay in Auth.Metadata. Credential metadata is non-secret and validated by
+	// the credential service; only the reserved endpoint routing fields are
+	// promoted here.
+	if baseURL := strings.TrimSpace(value.Metadata["base_url"]); baseURL != "" {
+		attributes["base_url"] = baseURL
+	}
+	if providerKey := strings.TrimSpace(value.Metadata["provider_key"]); providerKey != "" {
+		attributes["provider_key"] = providerKey
+	}
+	if compatName := strings.TrimSpace(value.Metadata["compat_name"]); compatName != "" {
+		attributes["compat_name"] = compatName
+	}
 	record := &auth.Auth{
-		ID:       value.CredentialID.String(),
-		Provider: provider,
-		Label:    value.ExternalStableID,
-		Status:   auth.StatusActive,
-		Attributes: map[string]string{
-			auth.AttributeAuthKind:      value.SourceKind,
-			auth.AttributeRuntimeOnly:   "true",
-			auth.AttributeSource:        auth.AuthSourcePostgres,
-			auth.AttributeSourceBackend: babloCredentialSource,
-			"region":                    value.Region,
-		},
-		Metadata: make(map[string]any, len(value.Metadata)+2),
+		ID:         value.CredentialID.String(),
+		Provider:   provider,
+		Label:      value.ExternalStableID,
+		Status:     auth.StatusActive,
+		ProxyURL:   strings.TrimSpace(value.ProxyRef),
+		Attributes: attributes,
+		Metadata:   make(map[string]any, len(value.Metadata)+2),
 	}
 	for key, item := range value.Metadata {
 		record.Metadata[key] = item

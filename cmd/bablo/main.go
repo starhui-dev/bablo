@@ -14,6 +14,9 @@ import (
 	"github.com/starhui-dev/bablo/internal/config"
 	"github.com/starhui-dev/bablo/internal/data"
 	"github.com/starhui-dev/bablo/internal/httpapi"
+	"github.com/starhui-dev/bablo/internal/inference/cpa"
+	"github.com/starhui-dev/bablo/internal/proxy"
+	"github.com/starhui-dev/bablo/internal/scheduler"
 	"github.com/starhui-dev/bablo/internal/secret"
 )
 
@@ -50,13 +53,15 @@ func run(arguments []string) int {
 		logger.Error("bablo_credential_config_error", "error", err)
 		return 1
 	}
-
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	var store *data.Store
 	var authHandler *auth.Handler
 	var redisReady bool
 	var serverOptions []httpapi.Option
 	var credentialKeys *secret.Keyring
+	var catalog *catalogRuntime
+	var schedulerCoordinator scheduler.Coordinator
+	var cpaAdapter *cpa.Adapter
 	if len(credentialCfg.Keys) > 0 {
 		credentialKeys, err = secret.NewKeyring(credentialCfg.CurrentVersion, credentialCfg.Keys)
 		if err != nil {
@@ -145,23 +150,110 @@ func run(arguments []string) int {
 		if authHandler != nil {
 			serverOptions = append(serverOptions, httpapi.WithAPIKeyHandler(authHandler.Protect(apiKeyHandler)))
 		}
-		catalogOptions, err := catalogServerOptions(store, authHandler, credentialKeys, logger)
+		catalog, err = newCatalogRuntime(store, authHandler, credentialKeys, logger)
 		if err != nil {
 			logger.Error("bablo_catalog_error", "error", err)
 			return 1
 		}
-		serverOptions = append(serverOptions, catalogOptions...)
+		serverOptions = append(serverOptions, catalog.options...)
+		if cfg.CPAConfigPath == "" {
+			serverOptions = append(serverOptions, httpapi.WithInferenceHandler(proxy.NewUnavailableHandler(apiKeyService)))
+		} else {
+			if catalog.credentialService == nil {
+				logger.Error("bablo_inference_config_error", "error", "BABLO_CREDENTIAL_ENCRYPTION_KEY is required when BABLO_CPA_CONFIG_PATH is configured")
+				return 1
+			}
+			if cfg.RedisURL != "" {
+				coordinatorCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				schedulerCoordinator, err = scheduler.NewRedisCoordinator(coordinatorCtx, cfg.RedisURL, scheduler.CoordinatorOptions{})
+				cancel()
+				if err != nil {
+					logger.Error("bablo_scheduler_coordinator_error", "error", err)
+					return 1
+				}
+			} else {
+				schedulerCoordinator = scheduler.NewMemoryCoordinator()
+			}
+			defer func() {
+				if schedulerCoordinator != nil {
+					if closeErr := schedulerCoordinator.Close(); closeErr != nil {
+						logger.Error("bablo_scheduler_coordinator_close_error", "error", closeErr)
+					}
+				}
+			}()
+			schedulerRepository, schedulerErr := scheduler.NewRepository(store)
+			if schedulerErr != nil {
+				logger.Error("bablo_scheduler_repository_error", "error", schedulerErr)
+				return 1
+			}
+			schedulerService, schedulerErr := scheduler.NewService(schedulerRepository, schedulerCoordinator, scheduler.Options{})
+			if schedulerErr != nil {
+				logger.Error("bablo_scheduler_service_error", "error", schedulerErr)
+				return 1
+			}
+			cpaAdapter, err = cpa.NewService(cpa.ServiceOptions{ConfigPath: cfg.CPAConfigPath})
+			if err != nil {
+				logger.Error("bablo_cpa_adapter_error", "error", err)
+				return 1
+			}
+			defer func() {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+				defer cancel()
+				if shutdownErr := cpaAdapter.Shutdown(shutdownCtx); shutdownErr != nil {
+					logger.Error("bablo_cpa_shutdown_error", "error", shutdownErr)
+				}
+			}()
+			if err := cpaAdapter.ReconcileCredentials(context.Background(), catalog.credentialService); err != nil {
+				logger.Error("bablo_cpa_credential_reconcile_error", "error", err)
+				return 1
+			}
+			if err := cpaAdapter.Start(context.Background()); err != nil {
+				logger.Error("bablo_cpa_start_error", "error", err)
+				return 1
+			}
+			readyCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err = cpaAdapter.WaitReady(readyCtx)
+			cancel()
+			if err != nil {
+				logger.Error("bablo_cpa_ready_error", "error", err)
+				return 1
+			}
+			inferenceHandler, handlerErr := proxy.NewHandler(proxy.Options{
+				APIKeys:         apiKeyService,
+				Models:          catalog.modelService,
+				Routes:          catalog.routeService,
+				Scheduler:       schedulerService,
+				Engine:          cpaAdapter,
+				HealthReporter:  catalog.credentialService,
+				RuntimeReporter: cpaAdapter,
+				Logger:          logger,
+			})
+			if handlerErr != nil {
+				logger.Error("bablo_proxy_handler_error", "error", handlerErr)
+				return 1
+			}
+			serverOptions = append(serverOptions, httpapi.WithInferenceHandler(inferenceHandler))
+		}
+	} else if cfg.CPAConfigPath != "" {
+		logger.Error("bablo_inference_config_error", "error", "BABLO_DATABASE_URL is required when BABLO_CPA_CONFIG_PATH is configured")
+		return 1
 	} else if len(authCfg.EncryptionKey) > 0 || credentialKeys != nil {
 		logger.Error("bablo_secret_database_error", "error", "BABLO_DATABASE_URL is required when authentication or Credential storage is configured")
 		return 1
 	}
 
+	if store == nil {
+		serverOptions = append(serverOptions, httpapi.WithInferenceHandler(proxy.NewUnavailableHandler(nil)))
+	}
 	server := httpapi.New(cfg, logger, buildVersion, serverOptions...)
 	if store != nil {
 		server.SetDependencyReady("postgres", true)
 	}
 	if redisReady {
 		server.SetDependencyReady("redis", true)
+	}
+	if cpaAdapter != nil {
+		server.SetDependencyReady("inference", true)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
