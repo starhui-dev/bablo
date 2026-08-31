@@ -87,6 +87,8 @@ erDiagram
 - `usage_events`：不可变结算事实，包含 request/user/key、requested/resolved model、provider/route version/credential、price version、token breakdown、status/error、latency/TTFT、estimated/provenance、settlement key；
 - `usage_reconciliations`：CPA usage signal/迟到 usage/估算修正与差异，不覆盖原始 UsageEvent；
 - `scheduler_decisions`：request/attempt、候选内部 ID、排除原因、score/priority、selected、fallback chain、strategy version；JSON 只含非敏感 metadata；
+
+- `scheduler_decisions` 的选中字段同时保存 route version、target、provider、credential；新决策必须满足三者成组一致，历史仅有 target 的记录保持可读。`credentials.max_concurrency` 为 1–10000；Redis 仅保存带 TTL 的 lease、cursor、affinity，不是事实源。
 - `outbox_events`：与关键业务事务同库提交，worker 可重试、claim、幂等消费。
 
 ### Wallet / payment / audit
@@ -148,9 +150,11 @@ Raw Usage、scheduler/audit、payment payload hash 和 rollup 的 retention 必�
 - `migrations/000006_model_catalog_integrity.sql` 新增 `model_aliases`、大小写不敏感且跨表互斥的 model identifier guards、provider model discovery/review 状态、published price entry/version guards 与生效区间互斥。
 - `migrations/000007_credential_security.sql` 增加 Credential runtime metadata、source-kind/secret ciphertext/key/rotation 约束、source identity guard、secret history append-only、pool identity guard 和 active-secret 索引。
 - `migrations/000008_route_integrity.sql` 增加 Route match/hash/metadata 约束；Route version 仅允许一次性关闭，Route target immutable，所有新 target 集合必须通过新 version 发布。
+- `migrations/000009_scheduler_integrity.sql` 增加 Credential 并发容量约束、Scheduler 决策选中路由/provider/credential 关联字段、历史兼容约束和数据库选择一致性 trigger；Scheduler 运行态仍由 Redis TTL 状态协调。
 - `internal/model` 实现 canonical ID/alias 解析、public/admin 列表、能力/visibility/billing class 校验和 route readiness；alias 禁用后不被重新分配。
 - `internal/provider` 实现资源政策、上游模型映射和完整 discovery snapshot reconcile；新增发现 pending/disabled，缺失只改变 discovery signal，批准配置不被发现覆盖。
 - `internal/credential` 实现 non-secret DTO、AES-GCM secret create/rotate/reencrypt、active runtime source、monotonic health、Provider pool membership 和 opaque composite cursor；管理员 API 永不返回 secret value。
 - `internal/pricing` 使用 decimal string + `numeric(30,12)`，实现 draft/activate/retire 与 provider_model -> model -> global 价格解析；缺价/禁用计费 fail closed。
 - `internal/route` 实现 P0 exact route、多 Provider/Pool candidate、snapshot hash、active version 原子切换、opaque cursor、preview/resolution 和管理员 API；resolver 只产出 scheduler candidates，不选择 Credential。
+- `internal/scheduler` 实现 target/member 硬过滤、429 cooldown、quota freshness/reset、priority/fill-first/round-robin/weighted-round-robin/quota-aware、有限 affinity、Redis/内存 TTL lease/cursor/affinity 和 immutable Decision Log；它只接收 Route resolution，不暴露 CPA 类型。
 - `cmd/bablo/catalog.go` 将用户模型目录和 admin model/provider/price/route handlers 接入 Web Session/RBAC；`Store.WithTx` 保持 repository 事务边界，应用启动不自动迁移。

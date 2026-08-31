@@ -19,11 +19,13 @@ API Key -> policy/entitlement -> public model -> route version snapshot -> candi
 Scheduler 两阶段执行：
 
 1. **硬过滤**：policy/resource commercial policy、target/credential enabled、revoked/disabled、model capability、cooldown/health、quota available/staleness policy、地区/代理要求、concurrency lease；
-2. **选择**：P0 使用 priority + 稳定 round-robin（稳定 target ID 作为 tie-breaker），不使用隐式随机；每次输出 selected/fallback/reason。P1 再加入 weighted-round-robin、fill-first、quota-aware 和有限 session affinity。
+2. **选择**：生产默认使用 priority + 稳定 round-robin（稳定 target/member/credential ID 作为 tie-breaker），不使用隐式随机；同一模块提供显式可选的 weighted-round-robin、fill-first、quota-aware 和有限 session affinity。高级策略不改变硬过滤顺序，默认策略不因其存在而自动切换。
 
 每次决策写 `scheduler_decisions`：候选集、排除原因、priority/weight/score、selected credential、fallback chain、strategy version、request/attempt。session affinity 只能修正排序，不能绕过硬过滤；绑定 credential 不可用时安全 fallback 并记录原因。
 
 Redis 只存带 TTL 的 concurrency lease、affinity、RR cursor；quota snapshot 来自带 `observed_at`/confidence 的 poller，stale/missing 按保守策略处理。所有 lease 使用 owner token finally/recovery 释放。
+
+实现于 2026-08-30：`internal/scheduler` 已按上述边界落地；`migrations/000009_scheduler_integrity.sql` 记录 resolved route/provider/credential 并校验选择归属，`credentials.max_concurrency` 定义每个 Credential 的 TTL lease 槽位数。数据面将在 `bablo-proxy` 阶段调用 Route resolver 后调用 Scheduler；当前阶段不直接执行 CPA 请求。
 
 ## 后果
 

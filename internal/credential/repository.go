@@ -39,7 +39,7 @@ type rowScanner interface {
 
 const credentialColumns = `
 	c.id, c.provider_id, p.slug, p.resource_type, p.commercial_allowed,
-	c.external_stable_id, c.source_kind, c.status, c.region, c.proxy_ref, c.metadata,
+	c.external_stable_id, c.source_kind, c.status, c.max_concurrency, c.region, c.proxy_ref, c.metadata,
 	c.created_at, c.updated_at`
 
 func scanCredential(row rowScanner) (Credential, error) {
@@ -54,6 +54,7 @@ func scanCredential(row rowScanner) (Credential, error) {
 		&value.ExternalStableID,
 		&value.SourceKind,
 		&value.Status,
+		&value.MaxConcurrency,
 		&value.Region,
 		&value.ProxyRef,
 		&metadataJSON,
@@ -91,14 +92,15 @@ func (r *Repository) create(ctx context.Context, actorID uuid.UUID, input Create
 	err = r.store.WithTx(ctx, func(q data.Querier) error {
 		if _, err := q.Exec(ctx, `
 			INSERT INTO credentials (
-				id, provider_id, external_stable_id, source_kind, status, region, proxy_ref, metadata
+				id, provider_id, external_stable_id, source_kind, status, max_concurrency, region, proxy_ref, metadata
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 			credentialID,
 			input.ProviderID,
 			input.ExternalStableID,
 			input.SourceKind,
 			statusForCreate(input.Enabled),
+			input.MaxConcurrency,
 			input.Region,
 			input.ProxyRef,
 			metadataJSON,
@@ -329,14 +331,17 @@ func (r *Repository) update(ctx context.Context, actorID, credentialID uuid.UUID
 		if input.Status != nil {
 			current.Status = *input.Status
 		}
+		if input.MaxConcurrency != nil {
+			current.MaxConcurrency = *input.MaxConcurrency
+		}
 		metadataJSON, err := json.Marshal(current.Metadata)
 		if err != nil {
 			return fmt.Errorf("encode credential metadata: %w", err)
 		}
 		if _, err := q.Exec(ctx, `
 			UPDATE credentials
-			SET status = $2, region = $3, proxy_ref = $4, metadata = $5, updated_at = now()
-			WHERE id = $1 AND deleted_at IS NULL`, credentialID, current.Status, current.Region, current.ProxyRef, metadataJSON); err != nil {
+			SET status = $2, max_concurrency = $3, region = $4, proxy_ref = $5, metadata = $6, updated_at = now()
+			WHERE id = $1 AND deleted_at IS NULL`, credentialID, current.Status, current.MaxConcurrency, current.Region, current.ProxyRef, metadataJSON); err != nil {
 			return mapRepositoryError(err)
 		}
 		if err := audit.Insert(ctx, q, audit.Event{

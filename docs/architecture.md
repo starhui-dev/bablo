@@ -1,7 +1,7 @@
 # Bablo 总体架构
 
 > 版本：架构规划基线
-> 日期：2026-08-29
+> 日期：2026-08-31
 > 相关 ADR：`docs/adr/0001-cpa-sdk-boundary.md`、`docs/adr/0002-postgres-source-of-truth.md`、`docs/adr/0003-usage-ledger-billing.md`、`docs/adr/0004-model-routing-and-scheduler.md`、`docs/adr/0005-web-session-authentication.md`
 
 ## 1. 架构结论
@@ -154,7 +154,7 @@ type Stream interface {
 
 ## 7. 调度第一版
 
-候选顺序固定为：route target 的 priority 升序、配置权重、稳定 target ID。先硬过滤：policy/resource、enabled/revoked、模型能力、cooldown/health、quota missing/stale 策略、concurrency lease。P0 只实现无隐式随机的 round-robin/priority 选择；每次写候选、排除原因、score、selected、fallback。P1 再加入 weighted/fill-first/quota-aware 和有限 session affinity，且 affinity 永远不能绕过硬过滤。
+候选先按 route target priority、pool member priority 和稳定 target/member/credential ID 分组，随后执行显式策略。硬过滤覆盖 resource commercial policy、target/provider model/pool/provider/member/credential enabled 状态、revoked、协议/模型能力、429 cooldown、地区/代理、quota missing/stale/reset/exhausted 和 concurrency lease。生产默认使用无隐式随机的 round-robin；同一模块已实现显式 weighted-round-robin、fill-first、quota-aware 和有限 session affinity，且 affinity 永远不能绕过硬过滤。每次成功或无可用候选都写 candidates、排除原因、score/priority、selected target/provider/credential、fallback chain 和 strategy version。Redis 以 TTL + owner token 保存 lease/cursor/affinity；未配置 Redis 时仅允许 P0 单实例使用内存协调器。
 
 ## 8. 可观测性与隐私
 

@@ -57,6 +57,7 @@ type Credential struct {
 	ExternalStableID  string             `json:"external_stable_id"`
 	SourceKind        string             `json:"source_kind"`
 	Status            string             `json:"status"`
+	MaxConcurrency    int                `json:"max_concurrency"`
 	Region            string             `json:"region"`
 	ProxyRef          string             `json:"proxy_ref"`
 	Metadata          map[string]string  `json:"metadata"`
@@ -120,6 +121,7 @@ type CreateInput struct {
 	SourceKind       string            `json:"source_kind"`
 	Region           string            `json:"region"`
 	ProxyRef         string            `json:"proxy_ref"`
+	MaxConcurrency   int               `json:"max_concurrency"`
 	Metadata         map[string]string `json:"metadata"`
 	Secrets          []SecretInput     `json:"secrets"`
 	Enabled          bool              `json:"enabled"`
@@ -127,10 +129,11 @@ type CreateInput struct {
 
 // UpdateInput changes metadata or lifecycle state. Provider identity is immutable.
 type UpdateInput struct {
-	Region   *string            `json:"region"`
-	ProxyRef *string            `json:"proxy_ref"`
-	Metadata *map[string]string `json:"metadata"`
-	Status   *string            `json:"status"`
+	Region         *string            `json:"region"`
+	ProxyRef       *string            `json:"proxy_ref"`
+	Metadata       *map[string]string `json:"metadata"`
+	Status         *string            `json:"status"`
+	MaxConcurrency *int               `json:"max_concurrency"`
 }
 
 // PoolInput creates or updates a provider-owned pool.

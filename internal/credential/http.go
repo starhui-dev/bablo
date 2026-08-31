@@ -44,6 +44,7 @@ type createRequest struct {
 	ExternalStableID string            `json:"external_stable_id"`
 	SourceKind       string            `json:"source_kind"`
 	Region           string            `json:"region"`
+	MaxConcurrency   int               `json:"max_concurrency"`
 	ProxyRef         string            `json:"proxy_ref"`
 	Metadata         map[string]string `json:"metadata"`
 	Secrets          []SecretInput     `json:"secrets"`
@@ -51,10 +52,11 @@ type createRequest struct {
 }
 
 type updateRequest struct {
-	Region   *string            `json:"region"`
-	ProxyRef *string            `json:"proxy_ref"`
-	Metadata *map[string]string `json:"metadata"`
-	Status   *string            `json:"status"`
+	Region         *string            `json:"region"`
+	ProxyRef       *string            `json:"proxy_ref"`
+	Metadata       *map[string]string `json:"metadata"`
+	Status         *string            `json:"status"`
+	MaxConcurrency *int               `json:"max_concurrency"`
 }
 
 type rotateRequest struct {
@@ -145,6 +147,7 @@ func (h *handler) createCredential(w http.ResponseWriter, r *http.Request) {
 		ExternalStableID: payload.ExternalStableID,
 		SourceKind:       payload.SourceKind,
 		Region:           payload.Region,
+		MaxConcurrency:   payload.MaxConcurrency,
 		ProxyRef:         payload.ProxyRef,
 		Metadata:         payload.Metadata,
 		Secrets:          payload.Secrets,
@@ -225,7 +228,7 @@ func (h *handler) updateCredential(w http.ResponseWriter, r *http.Request, crede
 		return
 	}
 	value, err := h.service.Update(r.Context(), session.UserID, credentialID, UpdateInput{
-		Region: payload.Region, ProxyRef: payload.ProxyRef, Metadata: payload.Metadata, Status: payload.Status,
+		Region: payload.Region, ProxyRef: payload.ProxyRef, Metadata: payload.Metadata, Status: payload.Status, MaxConcurrency: payload.MaxConcurrency,
 	}, httpapi.RequestID(r.Context()))
 	if err != nil {
 		h.writeError(w, r, err)

@@ -313,6 +313,12 @@ func validateCreate(input CreateInput) (CreateInput, error) {
 	if err != nil {
 		return CreateInput{}, err
 	}
+	if input.MaxConcurrency == 0 {
+		input.MaxConcurrency = 1
+	}
+	if input.MaxConcurrency < 1 || input.MaxConcurrency > 10000 {
+		return CreateInput{}, ErrInvalidInput
+	}
 	if len(input.Secrets) == 0 || len(input.Secrets) > 8 {
 		return CreateInput{}, ErrInvalidInput
 	}
@@ -385,6 +391,9 @@ func validateUpdate(input UpdateInput) (UpdateInput, error) {
 		}
 		input.Metadata = &value
 	}
+	if input.MaxConcurrency != nil && (*input.MaxConcurrency < 1 || *input.MaxConcurrency > 10000) {
+		return UpdateInput{}, ErrInvalidInput
+	}
 	if input.Status != nil {
 		value := strings.TrimSpace(*input.Status)
 		if !validStatus(value) {
@@ -409,7 +418,7 @@ func validatePoolInput(input PoolInput) (PoolInput, error) {
 }
 
 func emptyUpdate(input UpdateInput) bool {
-	return input.Region == nil && input.ProxyRef == nil && input.Metadata == nil && input.Status == nil
+	return input.Region == nil && input.ProxyRef == nil && input.Metadata == nil && input.Status == nil && input.MaxConcurrency == nil
 }
 
 func (r *Repository) sealInputs(credentialID uuid.UUID, inputs []SecretInput) ([]sealedSecret, error) {
