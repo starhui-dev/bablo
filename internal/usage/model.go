@@ -112,6 +112,7 @@ type FinalizeInput struct {
 	RouteVersionID  *uuid.UUID
 	CredentialID    *uuid.UUID
 	PriceVersionID  *uuid.UUID
+	WalletID        *uuid.UUID
 	Usage           TokenUsage
 	AmountMinor     *int64
 	Currency        string
@@ -142,6 +143,7 @@ type Event struct {
 	RouteVersionID  *uuid.UUID     `json:"route_version_id,omitempty"`
 	CredentialID    *uuid.UUID     `json:"credential_id,omitempty"`
 	PriceVersionID  *uuid.UUID     `json:"price_version_id,omitempty"`
+	WalletID        *uuid.UUID     `json:"wallet_id,omitempty"`
 	Usage           TokenUsage     `json:"usage"`
 	AmountMinor     *int64         `json:"amount_minor,omitempty"`
 	Currency        string         `json:"currency,omitempty"`

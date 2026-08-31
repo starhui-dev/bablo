@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/starhui-dev/bablo/internal/apikey"
+	"github.com/starhui-dev/bablo/internal/billing"
 	"github.com/starhui-dev/bablo/internal/credential"
 	"github.com/starhui-dev/bablo/internal/inference"
 	catalogmodel "github.com/starhui-dev/bablo/internal/model"
@@ -282,14 +283,27 @@ func (f *fakeProxyUsage) BeginRequest(_ context.Context, input usage.StartInput)
 	return f.handle, nil
 }
 
-func (f *fakeProxyUsage) Finalize(_ context.Context, _ usage.RequestHandle, input usage.FinalizeInput) (usage.Event, error) {
+func (f *fakeProxyUsage) Finalize(_ context.Context, handle usage.RequestHandle, input usage.FinalizeInput) (usage.Event, error) {
 	f.mu.Lock()
 	f.finalizations = append(f.finalizations, input)
 	f.mu.Unlock()
 	if f.finalizeErr != nil {
 		return usage.Event{}, f.finalizeErr
 	}
-	return usage.Event{ID: uuid.MustParse("bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb")}, nil
+	return usage.Event{
+		ID:              uuid.MustParse("bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"),
+		RequestRecordID: handle.RecordIDPointer(),
+		RequestID:       handle.RequestID,
+		UserID:          uuidPointer(handle.UserID),
+		APIKeyID:        uuidPointer(handle.APIKeyID),
+		PriceVersionID:  cloneUUID(input.PriceVersionID),
+		WalletID:        cloneUUID(input.WalletID),
+		Usage:           input.Usage,
+		AmountMinor:     input.AmountMinor,
+		Currency:        input.Currency,
+		Estimated:       input.Estimated,
+		TerminalStatus:  input.TerminalStatus,
+	}, nil
 }
 
 func (f *fakeProxyUsage) RecordReconciliation(_ context.Context, _ usage.ReconciliationInput) (usage.Reconciliation, error) {
@@ -318,6 +332,58 @@ func (f *fakeProxyPrices) ResolveSnapshot(_ context.Context, modelID uuid.UUID, 
 		return pricing.Snapshot{}, f.err
 	}
 	return f.snapshot, nil
+}
+
+type fakeProxyBilling struct {
+	quote       billing.Quote
+	quoteErr    error
+	reservation billing.Reservation
+	reserveErr  error
+	settleErr   error
+
+	mu           sync.Mutex
+	quoteCalls   []usage.TokenUsage
+	reserveCalls []billing.ReserveInput
+	settleCalls  []billing.SettleInput
+	releaseCalls []billing.ReleaseInput
+}
+
+func (f *fakeProxyBilling) Quote(snapshot pricing.Snapshot, observed usage.TokenUsage) (billing.Quote, error) {
+	f.mu.Lock()
+	f.quoteCalls = append(f.quoteCalls, observed)
+	f.mu.Unlock()
+	if f.quoteErr != nil {
+		return billing.Quote{}, f.quoteErr
+	}
+	quote := f.quote
+	if quote.Currency == "" {
+		quote.Currency = snapshot.Currency
+	}
+	return quote, nil
+}
+
+func (f *fakeProxyBilling) Reserve(_ context.Context, input billing.ReserveInput) (billing.Reservation, error) {
+	f.mu.Lock()
+	f.reserveCalls = append(f.reserveCalls, input)
+	f.mu.Unlock()
+	if f.reserveErr != nil {
+		return billing.Reservation{}, f.reserveErr
+	}
+	return f.reservation, nil
+}
+
+func (f *fakeProxyBilling) Settle(_ context.Context, input billing.SettleInput) (billing.Settlement, error) {
+	f.mu.Lock()
+	f.settleCalls = append(f.settleCalls, input)
+	f.mu.Unlock()
+	return billing.Settlement{}, f.settleErr
+}
+
+func (f *fakeProxyBilling) Release(_ context.Context, input billing.ReleaseInput) error {
+	f.mu.Lock()
+	f.releaseCalls = append(f.releaseCalls, input)
+	f.mu.Unlock()
+	return nil
 }
 
 type proxyStreamStep struct {
@@ -585,23 +651,33 @@ func TestHandlerMarksPartialUsageForReconciliation(t *testing.T) {
 		t.Fatalf("partial usage finalization = %+v", finalization)
 	}
 }
-func TestHandlerBindsResolvedPriceSnapshotToUsage(t *testing.T) {
+func TestHandlerBindsResolvedPriceSnapshotAndSettlesUsage(t *testing.T) {
 	handler, _, _, _, schedulerService, engine, _, _, _ := newProxyFixture(t)
 	recorder := &fakeProxyUsage{}
 	handler.usage = recorder
 	priceID := uuid.MustParse("aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaab")
+	walletID := uuid.MustParse("cccccccc-cccc-7ccc-8ccc-cccccccccccc")
+	reservationID := uuid.MustParse("dddddddd-dddd-7ddd-8ddd-dddddddddddd")
 	prices := &fakeProxyPrices{snapshot: pricing.Snapshot{
 		VersionID: priceID,
 		Scope:     pricing.ScopeProviderModel,
 		Currency:  "USD",
 		Prices:    map[string]string{pricing.DimensionInputToken: "1"},
 	}}
+	coordinator := &fakeProxyBilling{
+		quote: billing.Quote{AmountMinor: 7, Currency: "USD"},
+		reservation: billing.Reservation{
+			ID: reservationID, WalletID: walletID, AmountMinor: 9,
+			Currency: "USD", Status: billing.ReservationReserved,
+		},
+	}
 	handler.prices = prices
+	handler.billing = coordinator
 	engine.result = inference.ExecutionResult{
 		StatusCode: http.StatusOK,
 		Body:       []byte(`{"id":"chatcmpl-price","usage":{"prompt_tokens":2,"completion_tokens":1}}`),
 	}
-	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"model":"bablo-chat"}`))
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"model":"bablo-chat","max_completion_tokens":16}`))
 	request.Header.Set("X-Request-ID", "req-price-snapshot")
 	response := httptest.NewRecorder()
 
@@ -619,13 +695,97 @@ func TestHandlerBindsResolvedPriceSnapshotToUsage(t *testing.T) {
 	}
 	prices.mu.Unlock()
 	recorder.mu.Lock()
-	defer recorder.mu.Unlock()
 	if len(recorder.finalizations) != 1 {
 		t.Fatalf("finalizations = %d, want 1", len(recorder.finalizations))
 	}
 	finalization := recorder.finalizations[0]
-	if finalization.PriceVersionID == nil || *finalization.PriceVersionID != priceID || finalization.Currency != "USD" {
-		t.Fatalf("price snapshot in usage = %+v", finalization)
+	recorder.mu.Unlock()
+	if finalization.PriceVersionID == nil || *finalization.PriceVersionID != priceID || finalization.WalletID == nil || *finalization.WalletID != walletID || finalization.AmountMinor == nil || *finalization.AmountMinor != 7 || finalization.Currency != "USD" {
+		t.Fatalf("priced usage finalization = %+v", finalization)
+	}
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	if len(coordinator.reserveCalls) != 1 || coordinator.reserveCalls[0].EstimatedUsage.OutputTokens != 16 || coordinator.reserveCalls[0].Price.VersionID != priceID {
+		t.Fatalf("reserve calls = %+v", coordinator.reserveCalls)
+	}
+	if len(coordinator.settleCalls) != 1 || coordinator.settleCalls[0].ReservationID != reservationID || coordinator.settleCalls[0].Event.AmountMinor == nil || *coordinator.settleCalls[0].Event.AmountMinor != 7 {
+		t.Fatalf("settle calls = %+v", coordinator.settleCalls)
+	}
+}
+
+func TestHandlerRejectsInsufficientFundsBeforeUpstream(t *testing.T) {
+	handler, _, _, _, _, engine, lease, _, _ := newProxyFixture(t)
+	recorder := &fakeProxyUsage{}
+	priceID := uuid.MustParse("aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaac")
+	handler.usage = recorder
+	handler.prices = &fakeProxyPrices{snapshot: pricing.Snapshot{
+		VersionID: priceID,
+		Currency:  "USD",
+		Prices:    map[string]string{pricing.DimensionInputToken: "1"},
+	}}
+	handler.billing = &fakeProxyBilling{
+		quote:      billing.Quote{Currency: "USD"},
+		reserveErr: billing.ErrInsufficientFunds,
+	}
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"model":"bablo-chat"}`))
+	request.Header.Set("X-Request-ID", "req-no-funds")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusPaymentRequired || !strings.Contains(response.Body.String(), `"code":"insufficient_funds"`) {
+		t.Fatalf("insufficient funds response = %d body=%s", response.Code, response.Body.String())
+	}
+	if len(engine.executeCalls) != 0 || len(engine.streamCalls) != 0 {
+		t.Fatalf("insufficient funds reached upstream: execute=%d stream=%d", len(engine.executeCalls), len(engine.streamCalls))
+	}
+	if lease.releaseCalls != 1 {
+		t.Fatalf("scheduler lease releases = %d, want 1", lease.releaseCalls)
+	}
+}
+
+func TestHandlerSettlesReservedEstimateWhenUsageIsMissing(t *testing.T) {
+	handler, _, _, _, _, engine, _, _, _ := newProxyFixture(t)
+	recorder := &fakeProxyUsage{}
+	priceID := uuid.MustParse("aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaad")
+	walletID := uuid.MustParse("cccccccc-cccc-7ccc-8ccc-cccccccccccd")
+	reservationID := uuid.MustParse("dddddddd-dddd-7ddd-8ddd-ddddddddddde")
+	handler.usage = recorder
+	handler.prices = &fakeProxyPrices{snapshot: pricing.Snapshot{
+		VersionID: priceID,
+		Currency:  "USD",
+		Prices:    map[string]string{pricing.DimensionInputToken: "1"},
+	}}
+	coordinator := &fakeProxyBilling{
+		reservation: billing.Reservation{
+			ID: reservationID, WalletID: walletID, AmountMinor: 11,
+			Currency: "USD", Status: billing.ReservationReserved,
+		},
+	}
+	handler.billing = coordinator
+	engine.result = inference.ExecutionResult{StatusCode: http.StatusOK, Body: []byte(`{"id":"chatcmpl-missing"}`)}
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"model":"bablo-chat"}`))
+	request.Header.Set("X-Request-ID", "req-estimated-billing")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	recorder.mu.Lock()
+	if len(recorder.finalizations) != 1 {
+		t.Fatalf("finalizations = %d, want 1", len(recorder.finalizations))
+	}
+	finalization := recorder.finalizations[0]
+	recorder.mu.Unlock()
+	if !finalization.Estimated || finalization.AmountMinor == nil || *finalization.AmountMinor != 11 || finalization.TerminalStatus != usage.StatusReconcileNeeded {
+		t.Fatalf("estimated finalization = %+v", finalization)
+	}
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	if len(coordinator.settleCalls) != 1 || coordinator.settleCalls[0].Event.AmountMinor == nil || *coordinator.settleCalls[0].Event.AmountMinor != 11 {
+		t.Fatalf("estimated settle calls = %+v", coordinator.settleCalls)
 	}
 }
 
@@ -989,6 +1149,17 @@ func TestHandlerRejectsInvalidMethodsPathsAndBodies(t *testing.T) {
 			t.Fatalf("invalid body reached engine: execute=%d stream=%d", len(engine.executeCalls), len(engine.streamCalls))
 		}
 	})
+
+	t.Run("invalid max output tokens", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"model":"bablo-chat","max_tokens":0}`)))
+		if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), `"code":"invalid_request"`) {
+			t.Fatalf("invalid max tokens = %d body=%s", recorder.Code, recorder.Body.String())
+		}
+		if len(engine.executeCalls) != 0 || len(engine.streamCalls) != 0 {
+			t.Fatalf("invalid max tokens reached engine: execute=%d stream=%d", len(engine.executeCalls), len(engine.streamCalls))
+		}
+	})
 }
 
 func TestNewHandlerRequiresAuthorizerAndInvokesIdentityMiddleware(t *testing.T) {
@@ -1021,6 +1192,12 @@ func TestNewHandlerRequiresAuthorizerAndInvokesIdentityMiddleware(t *testing.T) 
 	if _, err := NewHandler(Options{
 		APIKeys: keys, Models: catalog, Engine: &fakeProxyEngine{},
 		UsageRecorder: &fakeProxyUsage{}, PriceResolver: &fakeProxyPrices{},
+	}); err == nil {
+		t.Fatal("NewHandler() accepted inference engine without billing coordinator")
+	}
+	if _, err := NewHandler(Options{
+		APIKeys: keys, Models: catalog, Engine: &fakeProxyEngine{},
+		UsageRecorder: &fakeProxyUsage{}, PriceResolver: &fakeProxyPrices{}, Billing: &fakeProxyBilling{},
 	}); err != nil {
 		t.Fatalf("NewHandler() rejected complete inference accounting dependencies: %v", err)
 	}

@@ -1,17 +1,17 @@
 # Bablo 实施状态
 
 > 最后更新：2026-08-31
-> 本次工作：完成 `bablo-usage` 的不可变 UsageEvent、request settlement 幂等、流式/取消/无 usage 结算、迟到 reconcile 和 transactional outbox，并接入 Proxy 实际执行路径；下一阶段进入 `bablo-billing`。
+> 本次工作：完成 `bablo-billing` 的精确计价、已发布价格绑定、Wallet reservation/settlement、available/reserved ledger、API Key budget 门禁、pending retry、余额重建与 Proxy 端到端接线；下一阶段进入 `bablo-payment`。
 
 ## 1. 仓库审计结果
 
 | 项目 | 观察结果 | 证据/影响 |
 |---|---|---|
 | 根目录 | `.omp/`、`docs/`、Go/Vue bootstrap 文件 | 保留既有提示词与规划文档，新增实现文件 |
-| 后端 | 已建立 Go bootstrap、CPA adapter、data layer、`internal/auth`、`internal/apikey`、`internal/model`、`internal/provider`、`internal/pricing`、`internal/credential`、`internal/route`、`internal/scheduler`、`internal/proxy`、`internal/usage` 与共享 `internal/audit`；`cmd/bablo` 已接线用户模型目录、管理员 catalog、Credential、Route、Scheduler、CPA runtime reconcile、Usage settlement 和推理数据面 API | Web Session 只保护管理面；admin catalog 强制 RBAC/MFA/CSRF；CPA 仍只在 adapter 边界 import |
-| 前端 | Vue 登录页已接通 Session/MFA 登录、CSRF header、路由守卫和退出；模型/Key/Credential 管理 UI 留到后续前端阶段 | 当前目录 HTTP API 已可供后续 UI 使用，Dashboard/404 仍为业务壳 |
-| 数据库 | 已落地 `000001`–`000010` migrations；`000010_usage_integrity.sql` 增加 Usage settlement request_id 唯一性、started/finished 时间快照、request link 与输入边界、outbox claim owner 约束 | `cmd/bablo-migrate` 显式执行 up/down；应用启动不自动改 schema；migration 测试已升级至 v10 |
-| 文档 | 架构规划、ADR、README、LICENSE、CPA compatibility 证据均已存在 | API/data/security/architecture/status 已同步模型目录与 Credential 实际契约 |
+| 后端 | 已建立 Go bootstrap、CPA adapter、data layer、`internal/auth`、`internal/apikey`、`internal/model`、`internal/provider`、`internal/pricing`、`internal/credential`、`internal/route`、`internal/scheduler`、`internal/proxy`、`internal/usage`、`internal/billing` 与共享 `internal/audit`；`cmd/bablo` 已接线用户模型目录、管理员 catalog、Credential、Route、Scheduler、CPA runtime reconcile、Usage 和 Wallet Billing 数据面 | Web Session 只保护管理面；admin catalog 强制 RBAC/MFA/CSRF；CPA 仍只在 adapter 边界 import |
+| 前端 | Vue 登录页已接通 Session/MFA 登录、CSRF header、路由守卫和退出；模型/Key/Credential/Wallet 管理 UI 留到后续前端阶段 | 当前目录 HTTP API 已可供后续 UI 使用，Dashboard/404 仍为业务壳 |
+| 数据库 | 已落地 `000001`–`000011` migrations；`000011_billing_integrity.sql` 增加 reservation/settlement、显式 available/reserved ledger delta、跨表 owner/request/price/Usage guard 和 ledger immutable trigger | `cmd/bablo-migrate` 显式执行 up/down；应用启动不自动改 schema；空 schema up、latest down、重放和真实 Billing transaction 已验证 |
+| 文档 | 架构规划、ADR、README、LICENSE、CPA compatibility 证据均已存在 | API/data/security/architecture/status 已同步 Billing 实际契约与后置 HTTP surface |
 | Git | 当前工作目录未检测到 `.git` 元数据，不能独立报告分支/未提交 diff | 未执行破坏性覆盖；保留既有文件并增量落盘 |
 | CPA 本地使用 | `go.mod` 精确 pin `v7.2.145`；adapter Build/Run/Shutdown、Manager Execute/Stream 和 Credential runtime 注册已接线 | 真实 Provider/OAuth E2E 仍缺外部凭据 |
 
@@ -39,6 +39,7 @@
 9. P0 单实例、邀请制/预充值或管理员授信；支付 Provider 未完成官方 sandbox/真实 E2E 前为 NO-GO。
 10. Web Session 与推理 API Key 完全分离；生产管理员操作必须 MFA，Session/CSRF 只存 hash，TOTP secret 使用版本化 AES-256-GCM ciphertext。
 11. API Key 固定为 `bablo_sk_` + 32-byte CSPRNG base64url；数据库只保存完整 Key SHA-256、展示 prefix 和 metadata；P0 rotate 原子替换且旧 secret 立即失效，不提供双 Key 并行窗口。
+12. Billing `unit_price` 固定为主货币单位/一个维度单位的 decimal；Go 使用整数/`math/big` 汇总后一次换算最小货币单位，禁止 float。非零 reservation/Usage 必须绑定同一已发布 price version、wallet、request 和 resolved route。
 
 ## 4. 上游 CPA 核验摘要
 
@@ -62,7 +63,7 @@
 | 10 | `bablo-scheduler` | 完成 | target/member 硬过滤、RR/weighted/fill/quota 策略、TTL lease/cursor/affinity、Decision Log、并发/race/fuzz |
 | 11 | `bablo-proxy` | 完成（真实 Provider/OAuth E2E 后置） | `/v1/models`、Chat、Responses；JSON/SSE、cancel、首包前后错误、request ID、header allowlist、Scheduler lease/health feedback |
 | 12 | `bablo-usage` | proxy execution facts | 完成：immutable UsageEvent、settlement key、stream cancel/no-usage/reconcile/outbox 测试 |
-| 13 | `bablo-billing` | usage/pricing/wallet schema | reservation/charge/release、price snapshot、并发 100+、重复 settle、无非法透支 |
+| 13 | `bablo-billing` | 完成 | exact decimal quote、published price、reservation/charge/release、daily/monthly budget、pending retry、ledger rebuild/immutable、并发与重复 settle 均有 PostgreSQL 测试 |
 | 14 | `bablo-payment` | payment business decision + provider docs | order state machine、验签 fixture、金额/币种/防重放/幂等；无真实凭据则 NO-GO |
 | 15 | `bablo-quota` | provider-specific legal probe | snapshot observed_at/stale/confidence、backoff、单 credential 防并发；不猜接口 |
 | 16 | `bablo-stats` | usage/ledger | 维度筛选、趋势/排行/trace；rollup 与 raw/ledger 对账 |
@@ -87,19 +88,19 @@
 - 生产反向代理的可信来源/IP 传递规范尚未确定；当前 IP allowlist 安全地只读取直连 `RemoteAddr`，在完成 trusted-proxy 设计前不得把客户端 `X-Forwarded-For` 当真实源；
 - CPA OAuth/Provider Credential、代理/地区和合法资源政策；
 - 是否首发 self-service payment、支付 Provider、merchant/app 资质、sandbox/真实凭据；
-- 计费币种、最小货币单位、价格表、负余额/退款/赠送/估算 token 业务规则；API Key daily/monthly budget 已保存，但消费门禁必须等待 Usage/Billing 事实源；
+- 生产计费币种、最终价格表、赠送/退款/负余额政策和缺失 usage 的估算业务规则仍需业务签字；P0 技术默认已明确为 ISO-style 最小货币单位、无负余额、缺失 usage 按 reservation 估算结算，改变规则必须版本化；
 - 管理员 MFA 已固定为生产强制；仍需决定普通用户是否强制 MFA、邀请/自注册策略、邮件或外部 IdP、数据 retention/合规和首发协议范围；
 - 目标用户客户端（是否必须 `/v1/messages`、Gemini 等）。
 
-缺少上述信息不影响已完成的本地控制面、Route 与 Scheduler 实现和测试，但阻塞真实上游/支付 E2E、代理后端客户端 IP allowlist、预算消费门禁、邮件自助恢复和最终生产 GO；不得伪造凭据或验证结果。
+缺少上述信息不影响已完成的本地控制面、Route、Scheduler、Usage 与 Billing 实现和测试，但阻塞真实上游/支付 E2E、代理后端客户端 IP allowlist、邮件自助恢复和最终生产 GO；不得伪造凭据或验证结果。
 
 ## 7. 下一阶段
 
 ```text
-/bablo-billing
+/bablo-payment
 ```
 
-`bablo-proxy` 已把 API Key entitlement、Route immutable snapshot、Scheduler credential lease、CPA runtime credential、price snapshot 与 `/v1/models`、Chat Completions、Responses 串通；Usage 已记录不可变结算事实、stream/cancel/no-usage 和 reconcile/outbox，下一步接入 Wallet reservation/charge/release。
+Billing 已完成预充值/管理员授信所需的不可变 wallet ledger、reservation 和 settlement 内核；下一步实现支付订单状态机、Provider webhook 验签/幂等/防重放，并在无真实商户凭据时保持对应能力 NO-GO。
 
 ## 8. Bootstrap 验收与验证证据
 
@@ -125,11 +126,10 @@
 - `go.mod` 精确 pin `github.com/jackc/pgx/v5 v5.10.0` 与 `github.com/pressly/goose/v3 v3.27.3`；Goose v3.27.3 要求 Go 1.25.7，当前项目/CPA Go 基线为 1.26.0，实际环境 Go 1.27.0。
 - `migrations/000001_initial_schema.sql` 覆盖 users/roles/sessions/MFA/API keys/policy/models/providers/credentials/pools/routes/quota/prices/requests/usage/wallet/payment/audit/outbox/stats；所有主键由应用 UUIDv7 提供。
 - `migrations/000002_fact_table_guards.sql` 建立事实表 append-only trigger 和 provider/pool/route target 归属校验；PostgreSQL 错误码断言已纳入集成测试。
-- `migrations/000003_wallet_payment_integrity.sql`、`000004_auth_security.sql`、`000005_api_key_security.sql`、`000006_model_catalog_integrity.sql`、`000007_credential_security.sql`、`000008_route_integrity.sql`、`000009_scheduler_integrity.sql` 与 `000010_usage_integrity.sql` 依次补充账务/支付、Web Session/MFA、API Key、模型目录/价格、Credential、Route、Scheduler 和 Usage 完整性；已应用迁移保持不可变。
+- `migrations/000003_wallet_payment_integrity.sql`、`000004_auth_security.sql`、`000005_api_key_security.sql`、`000006_model_catalog_integrity.sql`、`000007_credential_security.sql`、`000008_route_integrity.sql`、`000009_scheduler_integrity.sql`、`000010_usage_integrity.sql` 与 `000011_billing_integrity.sql` 依次补充账务/支付、Web Session/MFA、API Key、模型目录/价格、Credential、Route、Scheduler、Usage 和 Billing 完整性；已应用迁移保持不可变。
 - `internal/data.Open` 解析 pgxpool、固定会话 timezone=UTC/application_name=bablo 并执行真实 Ping；`Store.WithTx` 提供提交/回滚边界。
 - `cmd/bablo-migrate` 与 Makefile `migrate`/`migrate-down` 可显式运行 schema 变更；应用启动不自动迁移。
-- `go test -count=1 ./internal/data` 在真实 PostgreSQL 测试库验证空 schema up-by-one、连续升级至 v10、重复启动、核心唯一约束、append-only、Provider/pool/route target 与模型/价格/Credential/Route/Usage 约束。
-- PostgreSQL 17-alpine 集成测试已验证完整 `0 -> 10`，包括从 v9 带既有 UsageEvent 的时间回填；Bablo `/readyz` 仍因 inference `not_initialized` 保持 503，未伪造整体 ready。
+- 真实 PostgreSQL 已验证完整 `0 -> 11`、latest `11 -> 10 -> 11`、reservation/settlement 跨表约束、ledger UPDATE/DELETE SQLSTATE `55000` 和余额重建；Bablo `/readyz` 仍须按 inference 与外部依赖真实状态决定，未伪造整体 ready。
 
 ## 11. Auth 验收与验证证据
 
@@ -149,7 +149,7 @@
 - 每个用户 Key 在单事务内建立 metadata 标识的 default-deny managed policy；PATCH 原子替换该 policy 的多模型 allow entitlement，所有模型必须 enabled/public/non-deleted；授权执行 key+owner+secret version 有效性、显式 deny、allow、default action 的确定顺序，rotate 后陈旧 Principal 不能继续授权；
 - 自助接口 `GET/POST /api/v1/me/api-keys`、`PATCH /api/v1/me/api-keys/{id}`、`POST .../rotate|revoke` 已接线；Web Session `Protect` 强制 full session，unsafe method 复用 Origin+CSRF；所有 owner 查询 fail closed，响应 `Cache-Control: no-store`；
 - 数据面 `IdentityMiddleware` 严格解析单一 Bearer、只读取 `RemoteAddr`、context 只含内部 Principal；后续推理 handler 必须在解析 model/token 后调用 `Service.Authorize`；
-- RPM/TPM 使用 UTC 固定分钟窗口；Redis v9 Lua 原子 `HINCRBY` + `PEXPIRE`，配置后故障 fail closed；无 Redis 时使用有容量上限的单实例内存实现。daily/monthly budget 仅保存阈值并进入 Principal，真实消费门禁明确后置到 Usage/Billing；
+- RPM/TPM 使用 UTC 固定分钟窗口；Redis v9 Lua 原子 `HINCRBY` + `PEXPIRE`，配置后故障 fail closed；无 Redis 时使用有容量上限的单实例内存实现。daily/monthly budget 阈值进入 Principal，并已由 Billing 使用 API-key advisory transaction lock 对已结算 charge + active/pending reservation 执行真实消费门禁；
 - 真实 PostgreSQL 17-alpine + Redis 8-alpine：API Key 集成测试覆盖 owner 隔离、一次性明文/DB hash、普通与 IPv4-mapped IP canonicalization、expired/revoked、rotate 旧 secret/陈旧 Principal 失效及行锁等待跨过 expiry、PATCH 清除/替换、deny precedence、default allow 不越过 private visibility、一 Key 两模型、伪造 Principal owner、内存/Redis 100 goroutine 原子限流、HTTP CSRF/CRUD 和 Bearer context；
 - 完整验证：`go test -count=1 ./...`、`go test -race -count=1 ./internal/apikey ./internal/auth`、`go vet ./...`、两个 Go binary `go build -trimpath` 全部通过；前端 `pnpm lint`、3 tests、typecheck、Vite build 全部通过；migration 实际 up/down/up 通过；
 - 实际服务 smoke：Web Session 登录 200，Key create 201/list 200/patch 200/rotate 200/revoke 200，create `Cache-Control: no-store`，rotate `secret_version=2`，最终 status `revoked`；`/readyz` 显示 PostgreSQL/Redis `ok`、inference `not_initialized`，因此整体保持 NO-GO/503。
@@ -164,7 +164,7 @@
 - 管理 API 已接线 model/provider/provider-model collection 的 GET/POST、resource GET/PATCH、Provider reconcile 和 price create/get/activate/retire；统一通过 `ProtectRole(..., "admin")` 执行 Session、CSRF、admin RBAC 和生产 MFA，普通登录用户只能读取 `/api/v1/models`；所有写入同事务写 sanitized audit；
 - 真实 PostgreSQL 17-alpine 集成测试覆盖 alias promotion/冲突、discovery pending/approve/missing/no-overwrite、能力子集、模型能力收窄拒绝、缺价拒绝、Provider 级价格优先级、published mutation 55000、重叠区间拒绝、retired 历史解析与 replacement cutover；HTTP 端到端覆盖普通用户 403、管理员 model/provider/reconcile/approve/price activate 全链路；
 - 完整验证：真实 PostgreSQL 下 `go test -count=1 ./...`、`go test -race -count=1 ./internal/model ./internal/provider ./internal/pricing ./internal/auth ./internal/httpapi ./cmd/bablo`、`go vet ./...`、两个 Go binary build 全部通过；追加能力约束后 `go test -race -count=1 ./internal/model ./internal/provider ./internal/pricing` 通过；前端 `pnpm lint/typecheck/test/build` 通过；实际 `bablo` 进程 smoke 验证 `/healthz` 200、`/api/v1/models` 和 `/api/v1/admin/models` 未登录均 401；
-- 当前限制：CPA model registry 尚未接入自动 poller，reconcile 入口接受未来内部 worker 的完整发现快照；Route 已被 Proxy 数据面消费；真实价格表/币种/商业策略仍由业务提供，缺失保持 fail closed；Usage 已接通但 Billing、真实上游和预算消费门禁仍未接通，下一阶段进入 `bablo-billing`。
+- 当前限制：CPA model registry 尚未接入自动 poller，reconcile 入口接受未来内部 worker 的完整发现快照；Route/Price 已被 Proxy 与 Billing 数据面消费；真实价格表/币种/商业策略仍由业务提供，缺失保持 fail closed；真实上游和支付仍未接通，下一阶段进入 `bablo-payment`。
 
 ## 14. Credentials 验收与验证证据
 
@@ -193,7 +193,7 @@
 - Redis 协调器使用 `SET NX PX` owner-token lease、Lua 原子 release/renew/cursor、TTL affinity；内存实现只用于 P0 单实例和测试。Redis 错误不会被当成可用容量，避免并发超卖。
 - 每次成功/失败选择都写 immutable `scheduler_decisions`，保存候选、排除原因、selected target/provider/credential、fallback chain 和 strategy version；`000009_scheduler_integrity.sql` 以数据库约束和 trigger 校验选择归属。
 - 验证命令及结果：`go test -count=1 ./...`（无外部测试环境）通过；本次使用本机 PostgreSQL/Redis 测试实例执行 `go test -p 1 -race ./... -count=1`，16 packages 通过；`go vet ./...`、`go build -trimpath -o /tmp/bablo-proxy-verify ./cmd/bablo`、迁移二进制构建和前端 lint/typecheck/test/build 通过。并行运行带共享 PostgreSQL 的全套集成测试曾因连接/迁移锁竞争触发 Route 测试 30 秒 context deadline，串行 `-p 1` 通过，CI 应显式控制数据库连接容量或测试并发。
-- 当前限制：quota poller、真实 Provider health/429 feedback 和管理员 Decision 查询 API 仍未完成；Proxy 与 Usage 已接通，但 Billing 尚未接入，因此预算消费、Wallet 结算和整体生产仍 NO-GO。
+- 当前限制：quota poller、真实 Provider health/429 feedback 和管理员 Decision 查询 API 仍未完成；Proxy、Usage 与 Billing 已接通，Scheduler 的 provider quota-aware 能力仍需真实合法 probe 数据。
 
 ## 17. Proxy 验收与验证证据
 
@@ -213,13 +213,24 @@
 - `internal/usage` 定义 `StartInput`、`FinalizeInput`、不可变 `Event`、`Reconciliation`、`OutboxEvent`；事件记录 request/user/key、requested/resolved model、provider/provider model、route version、credential、price version、started/finished、token breakdown、amount/currency、status/error、latency/TTFT、estimated/provenance；不保存 Prompt/响应正文。
 - `BeginRequest` 以 `request_id` 幂等创建/恢复 `request_records`，重复请求的 metadata 不一致会返回冲突；`Finalize` 使用服务端 `usage:v1:<request_id>` settlement key，并同时写 UsageEvent、关闭 request record、写 transactional outbox。
 - 数据库 `000010_usage_integrity.sql` 增加 Usage `request_id` 唯一索引、started/finished 时间快照、request-record 关联与 settlement/request/source 边界约束、outbox `claimed_by`；迁移从 v9 回填历史 Usage 时间并恢复 UsageEvent append-only trigger，`000002` 继续阻止 UsageEvent/reconciliation 事实 UPDATE/DELETE，`internal/usage` repository 的 outbox 生命周期更新要求 owner。
-- Proxy 在 key/route/scheduler/engine 执行后按实际 resolved route 和 price snapshot 结算；配置 inference engine 时构造器强制同时提供 Usage Recorder 与 Price Resolver，避免可执行但不记账的旁路；非流式 JSON、Chat/Responses SSE、首包前失败、首包后错误、上游断流、客户端取消和上游未提供 usage 均生成一次事件；取消使用 `cancelled`，缺失/不可验证 usage 使用 `reconcile_needed` + `missing_usage` provenance，不伪装精确 token。
+- Proxy 在 key/route/scheduler/engine 执行路径按实际 resolved route 和 price snapshot 记录 Usage；配置 inference engine 时构造器强制同时提供 Usage Recorder、Price Resolver 与 Billing coordinator，避免可执行但不记账的旁路；非流式 JSON、Chat/Responses SSE、首包前失败、首包后错误、上游断流、客户端取消和上游未提供 usage 均生成一次事件。
 - Outbox 使用 PostgreSQL `FOR UPDATE SKIP LOCKED` claim、worker owner token、TTL stale recovery、发布/失败重试状态；非 owner ack/retry 被拒绝，失败 attempts 与短错误分类持久化，payload 仅包含非正文事实。
-- 验证命令及结果：`BABLO_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/btpanel_dev?sslmode=disable go test -p 1 -count=1 ./internal/data ./internal/usage ./internal/proxy`、`go test -p 1 -race -count=1 ./...`、`go vet ./...` 和 `go build -trimpath -o /tmp/bablo-usage-final ./cmd/bablo` 均通过；覆盖迁移 v9→v10 时间回填、request-record 关联错配拒绝、重复 Finalize、metadata/payload/reconcile 冲突、append-only SQL guard、outbox ownership/stale recovery、并发 Finalize 单事件、partial token usage 保守转 reconcile、stream cancel/no-usage/late SSE usage 与 price snapshot 绑定。
-- 当前限制：Usage outbox 尚未由独立 worker 接入 stats/health/billing；Wallet reservation/charge/release、价格金额最终结算和预算消费门禁属于下一阶段 `bablo-billing`；真实 CPA usage/provider 行为仍需外部兼容环境验证。
+- 验证命令及结果：真实 PostgreSQL 下 `go test ./internal/billing ./internal/usage -count=1` 通过；Proxy contract tests 覆盖 Billing reserve/settle、余额不足不触发上游和 missing usage estimated settlement；完整最终门禁见 Billing 章节。
+- 当前限制：Usage/Billing outbox 尚未由独立 worker 接入 stats/告警；真实 CPA usage/provider 行为仍需外部兼容环境验证。Wallet 用户/管理员 HTTP 查询与调账接口按 `bablo-user` / `bablo-admin` 后置，不在 Billing 内核阶段伪造。
 
-## 19. 下一阶段
+## 19. Billing 验收与验证证据
+
+- `internal/billing` 实现 `Quote`、`Reserve`、`Settle`、`Release`、`Credit`、`GetWallet`、`RebuildBalance`；entry type 覆盖 reservation、usage_charge、release、recharge、refund、grant、bonus、adjustment、admin_adjustment、expiration，管理员调账同事务写 audit；
+- 金额不使用 float：价格从 `pricing.Snapshot` decimal string 解析为 12 位缩放整数，按 token/request 维度聚合后一次向上取整到 currency minor unit；cache/reasoning 专属价会去除总量中已包含部分，缺专属价回退基础 input/output rate，不静默免费；
+- 非零 reservation 只接受 active/retired 且当前 effective 的 price version，并持久化 request/user/key、resolved model/provider model/route/provider/credential、预估 token 和金额；API-key advisory lock 串行化 daily/monthly budget，wallet row lock 保证 available/reserved 不为负；
+- settle 以 immutable UsageEvent 幂等消费 reservation：少收 release，多收补扣；补扣不足持久化 `pending` settlement/outbox，补款后同 Event 可重试完成。missing usage 按 reservation 金额写 `estimated + reconcile_needed`，不会释放为免费；
+- `000011_billing_integrity.sql` 为 ledger 增加 available/reserved delta、balance-after snapshot 和 source，新增 reservation/settlement、owner/request/price/Usage consistency trigger、全局 Usage charge 唯一和 ledger UPDATE/DELETE guard；UsageEvent 非零金额要求 wallet；
+- PostgreSQL 集成测试覆盖 credit/reserve/settle/release 幂等、未发布价格拒绝、价格版本切换仍按原 reservation snapshot 结算、daily budget、128 路并发余额竞争（100 成功、28 余额不足且无透支）、pending 补款重试、refund、负余额拒绝、ledger rebuild、admin adjustment audit 和 SQL immutable guard；金额单测覆盖精确 decimal、聚合取整、币种精度、breakdown 去重、超精度拒绝和 `int64` minor-unit 上溢；Proxy 测试覆盖 reserve-before-upstream、402 no-funds、actual settle、missing-usage estimated settle 和显式零 output-token 上限拒绝；
+- migration 已实际完成全量 up、latest down、再次 up；`BABLO_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/btpanel_dev?sslmode=disable go test -p 1 -count=1 ./...` 与同参数 `go test -p 1 -race -count=1 ./...` 均为 18 packages 通过、4 packages 无测试；`go vet ./...`、`go build -trimpath -o /tmp/bablo-billing-final ./cmd/bablo` 和迁移二进制构建均通过。
+- 当前限制：settlement/Usage outbox 独立 retry/告警 worker、用户 Wallet API、管理员 Wallet API/UI、真实业务币种/价格签字和支付 Provider 尚未完成；这些不影响账本内核测试，但阻塞相应生产能力。
+
+## 20. 下一阶段
 
 ```text
-/bablo-billing
+/bablo-payment
 ```

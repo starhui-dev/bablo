@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/starhui-dev/bablo/internal/apikey"
+	"github.com/starhui-dev/bablo/internal/billing"
 	"github.com/starhui-dev/bablo/internal/credential"
 	"github.com/starhui-dev/bablo/internal/inference"
 	catalogmodel "github.com/starhui-dev/bablo/internal/model"
@@ -82,6 +83,15 @@ type PriceSnapshotResolver interface {
 	ResolveSnapshot(context.Context, uuid.UUID, *uuid.UUID, time.Time) (pricing.Snapshot, error)
 }
 
+// BillingCoordinator reserves wallet funds before upstream execution and
+// settles the immutable UsageEvent afterward.
+type BillingCoordinator interface {
+	Quote(pricing.Snapshot, usage.TokenUsage) (billing.Quote, error)
+	Reserve(context.Context, billing.ReserveInput) (billing.Reservation, error)
+	Settle(context.Context, billing.SettleInput) (billing.Settlement, error)
+	Release(context.Context, billing.ReleaseInput) error
+}
+
 var (
 	_ KeyAuthorizer         = (*apikey.Service)(nil)
 	_ AuthorizedModelLister = (*apikey.Service)(nil)
@@ -102,6 +112,7 @@ type Options struct {
 	RuntimeReporter RuntimeReporter
 	UsageRecorder   UsageRecorder
 	PriceResolver   PriceSnapshotResolver
+	Billing         BillingCoordinator
 	Logger          *slog.Logger
 	MaxBodyBytes    int64
 	LeaseTTL        time.Duration
@@ -119,6 +130,7 @@ type Handler struct {
 	runtime      RuntimeReporter
 	usage        UsageRecorder
 	prices       PriceSnapshotResolver
+	billing      BillingCoordinator
 	logger       *slog.Logger
 	maxBodyBytes int64
 	leaseTTL     time.Duration
@@ -142,6 +154,9 @@ func NewHandler(options Options) (http.Handler, error) {
 	}
 	if options.Engine != nil && options.PriceResolver == nil {
 		return nil, errors.New("proxy handler requires price resolver when inference engine is configured")
+	}
+	if options.Engine != nil && options.Billing == nil {
+		return nil, errors.New("proxy handler requires billing coordinator when inference engine is configured")
 	}
 	if options.Logger == nil {
 		options.Logger = slog.Default()
@@ -174,6 +189,7 @@ func NewHandler(options Options) (http.Handler, error) {
 		runtime:      options.RuntimeReporter,
 		usage:        options.UsageRecorder,
 		prices:       options.PriceResolver,
+		billing:      options.Billing,
 		logger:       options.Logger,
 		maxBodyBytes: options.MaxBodyBytes,
 		leaseTTL:     options.LeaseTTL,

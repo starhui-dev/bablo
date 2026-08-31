@@ -30,9 +30,9 @@ Bablo InferenceEngine adapter]
 
 ### P0 单实例
 
-- `bablo`：HTTP server、CPA service、scheduler、usage settlement、outbox/quota worker；
+- `bablo`：HTTP server、CPA service、scheduler、usage settlement、wallet reservation/settlement、outbox/quota worker；
 - PostgreSQL：唯一业务数据库；只允许私网/容器网络访问；
-- Redis：API Key RPM/TPM 固定分钟窗口计数、后续 Usage/Billing 驱动的预算快速门禁、credential concurrency lease、短 TTL affinity/cursor；全部状态可重建，配置 Redis 后错误 fail closed；未配置时只允许 P0 单实例使用进程内计数；
+- Redis：API Key RPM/TPM 固定分钟窗口计数、credential concurrency lease、短 TTL affinity/cursor；全部状态可重建，配置 Redis 后错误 fail closed；未配置时只允许 P0 单实例使用进程内计数；daily/monthly budget 与钱包余额只由 PostgreSQL Billing 事实判定；
 - 反向代理/TLS：部署环境提供，域名不写死；
 - CPA management endpoint：不暴露公网，优先不启用远程管理。
 
@@ -61,8 +61,8 @@ Bablo InferenceEngine adapter]
 | `route` | public model 到版本化 target 的匹配/快照 | route snapshot、candidate targets | 未授权 fallback、请求中途变更快照 |
 | `scheduler` | 硬过滤、确定性选择、租约、Decision Log | candidates、policy、quota snapshot | 隐式随机、选择 disabled/revoked credential |
 | `usage` | request/attempt、immutable UsageEvent、reconcile/outbox | token/status/latency、settlement key | 依赖 CPA usage queue 作为最终账 |
-| `pricing` | price version、resolved target 价格 | price snapshot | 用 float、重写历史价格 |
-| `wallet` | reservation、charge、release、refund、adjustment | ledger entry、balance policy | UPDATE 历史 ledger、并发透支 |
+| `pricing` | price version、resolved target 价格 | 已发布 price snapshot | 用 float、重写历史价格、让 draft 入账 |
+| `wallet/billing` | exact quote、reservation、settlement、charge/release/refund/adjustment、budget | ledger entry、pending settlement、balance projection | UPDATE 历史 ledger、并发透支、只按 alias 计费 |
 | `payment` | order/event 状态机、webhook 验签边界 | provider event、idempotency key | 信任客户端支付成功 |
 | `stats` | 从 Usage/Ledger 的查询和 rollup | filters、aggregates | 自建另一套计费公式 |
 | `audit` | 管理员/敏感动作不可变记录 | actor/action/target/result | 记录 secret、Prompt/响应正文 |
@@ -81,13 +81,19 @@ P0 登录/MFA limiter 是有容量上限和自动过期的进程内状态，符�
 
 `internal/apikey.Handler -> apikey.Service -> apikey.Repository -> internal/data.Store`。Web Session `auth.Handler.Protect` 只为用户自助 Key API 提供 full-session、Origin 和 CSRF 边界；推理面只通过 `Authorization: Bearer` 进入 `apikey.Service.IdentityMiddleware`，上下文只携带内部 user/key ID、prefix、secret version 和限额，不携带 raw key/hash。实际推理 handler 在解析请求模型和 token 估算后必须继续调用 `Service.Authorize`，以当前 user/key/secret version 重新检查有效性，再完成 model entitlement 与 RPM/TPM 门禁，不能只依赖身份中间件。
 
-每个用户创建的 Key 拥有 default-deny managed policy；一个 policy 可允许多个 public model，显式 deny 优先于 allow。轮换原子替换同一 Key 的 hash，旧 secret 立即失效；P0 不提供双 Key 并行窗口。PostgreSQL 保存 Key、policy、授权和撤销事实；Redis 仅保存带 TTL 的固定窗口计数，Redis 丢失不能恢复权限或撤销状态。daily/monthly budget 阈值已进入 Key principal，真正消费门禁必须等待 Usage/Billing 事实源，不能把“尚无消费数据”伪装为零消费。
+每个用户创建的 Key 拥有 default-deny managed policy；一个 policy 可允许多个 public model，显式 deny 优先于 allow。轮换原子替换同一 Key 的 hash，旧 secret 立即失效；P0 不提供双 Key 并行窗口。PostgreSQL 保存 Key、policy、授权和撤销事实；Redis 仅保存带 TTL 的固定窗口计数，Redis 丢失不能恢复权限或撤销状态。daily/monthly budget 阈值进入 Key principal，并由 Billing 在 API-key advisory transaction lock 下与已结算 charge、active/pending reservation 一起核验。
 
 ### Route 调用边界
 
 `route.Service` 只负责把 requested public model/alias 解析为一个固定的 `route_version` 和有序 candidate targets；它不读取 API Key secret、不解密 Credential、不选择 pool member，也不执行上游请求。P0 仅支持 exact match，Route 创建或发布新版本在同一 PostgreSQL transaction 中校验 provider-model/pool 的 Provider 归属、模型映射和商业政策，关闭旧 version 后原子切换 `model_routes.active_version_id`。
 
 `route_versions` 与 `route_targets` 作为 immutable snapshot 保存；旧 version 只允许一次性写入 `effective_to`。管理员 preview 只返回 route candidates，不触发 scheduler 或 Credential runtime。推理流水线必须先完成 API Key entitlement，再使用 resolver 输出交给 scheduler。
+
+### Billing 调用边界
+
+`internal/proxy -> billing.Service -> billing.Repository -> internal/data.Store`。Proxy 先完成 entitlement、immutable route snapshot、Scheduler credential 选择和 resolved provider-model price snapshot，再调用 `Reserve`；非零 reservation 固定 request、wallet、route/provider/credential、price version 和预估 token。`Reserve` 先串行化 API Key budget，再锁 wallet 把 available 转入 reserved，失败时不调用 CPA。
+
+推理完成后 `internal/usage` 先提交 immutable UsageEvent/outbox，随后 Billing 使用该 Event 幂等 `Settle`。少于预留追加 release，多于预留从 available 补扣；补扣不足保留 reservation 并写 pending settlement/outbox。missing usage 按 reservation 金额标记 estimated/reconcile 后结算，不作为免费请求。ledger delta 是余额重建权威，数据库拒绝历史 UPDATE/DELETE；用户/管理员钱包 HTTP surface 后置到 `bablo-user` / `bablo-admin`。
 
 ## 4. 稳定领域接口
 
@@ -130,26 +136,27 @@ type Stream interface {
 ## 5. 推理请求流水线
 
 1. 入口生成/接收稳定 `request_id`，过滤 hop-by-hop 和敏感 header；
-2. 以 Bearer Key hash 查找 `api_key`，检查 active、expiry、IP、RPM/TPM/预算；
-3. 解析 user/policy/entitlement，拒绝无权限 public model；
-4. 读取 model + route 配置，建立请求开始时的 route/price snapshot；
-5. 预算预检：低成本请求可直接门禁，长上下文/高价请求写 reservation；
-6. route 精确匹配得到 candidates；
-7. scheduler 硬过滤 enabled、支持能力、resource policy、cooldown、quota freshness、concurrency lease，再按确定性策略选择；
-8. 通过 CPA adapter 执行非流式/流式；Credential runtime 由 PostgreSQL service 解密后以 `runtime_only` auth 注册，CPA 不成为主数据源；所有上游错误映射到 Bablo error class；
-9. 发送响应。流式首个 payload 发出后不得透明切换 credential；客户端取消仍须释放租约并尽力取得 usage；
-10. 生成一次 immutable UsageEvent，按 resolved provider/model/route/credential/price version 结算；
-11. 在同一事务写 settlement/outbox，异步更新 stats、health、reconciliation；
+2. 以 Bearer Key hash 查找 `api_key`，检查 active、expiry、IP、模型 entitlement 和 RPM/TPM；
+3. 解析 canonical public model 和 immutable route version，得到有序 candidates；
+4. scheduler 硬过滤 resource policy、enabled/revoked、协议/能力、cooldown、quota freshness 和 concurrency lease，再按确定性策略选择具体 provider model/credential；
+5. 针对实际 resolved provider model 解析已发布且当前生效的 price snapshot；
+6. Billing 以 API Key budget lock + wallet row lock执行 daily/monthly budget 和 available -> reserved；余额不足、预算超限或缺价时在调用 CPA 前失败；
+7. 通过 CPA adapter 执行非流式/流式；Credential runtime 由 PostgreSQL service 解密后以 `runtime_only` auth 注册，CPA 不成为主数据源；
+8. 流式首个 payload 发出后不得透明切换 credential；客户端取消仍须释放租约并尽力取得 usage；
+9. 生成一次 immutable UsageEvent，绑定 wallet、resolved provider/model/route/credential 和 price version；缺失 usage 标为 estimated/reconcile-needed 并使用 reservation 金额；
+10. Billing 以 UsageEvent 幂等 settle：消费 reserved、释放余量或补扣 available；不足写 pending/retry outbox，不静默免费；
+11. 异步 worker 消费 Usage/Billing outbox，更新 stats、health、告警和 reconciliation；
 12. 记录不含 secret/body 的日志、metrics 和 scheduler decision。
 
 ## 6. 事务边界与失败语义
 
-- **鉴权/路由**：读事务或一致性快照；一个请求使用固定 route/price version；
-- **预算预留**：钱包行锁 + 幂等 reservation key；拒绝时不触发上游请求；
-- **结算**：`usage_events`、reservation release/charge ledger 和 outbox 在一个 PostgreSQL transaction 内提交；失败进入 retry/reconcile，不静默免费；
+- **鉴权/路由**：读事务或一致性快照；一个请求使用固定 route version；
+- **预算预留**：API-key advisory transaction lock 计算周期 charge + active/pending reservation，再锁 wallet 行；reservation/ledger/outbox 同事务提交，拒绝时不触发上游请求；
+- **Usage finalize**：immutable `usage_events` 与 Usage outbox 同事务提交；与 Billing settlement 分成可恢复的两个事务边界，崩溃窗口由 request/reservation/Usage 唯一键和 retry worker 收敛；
+- **结算**：reservation、wallet projection、usage charge/release ledger、`billing_settlements` 与 Billing outbox 同事务提交；不足进入 pending，不产生负余额或静默免费；
 - **支付**：webhook 验签、订单状态变更、payment event、recharge ledger/outbox 在一个 transaction 内完成，provider event ID 唯一；
 - **Scheduler lease**：Redis `SET NX PX` + owner token，finally/recovery 释放；Redis 故障时进入保守失败，而不是超卖并发；
-- **CPA 失败**：首包前允许有限、可记录的 fallback；首包后只上报错误并结算已知 usage；不得重复真实执行请求；
+- **CPA 失败**：首包前允许有限、可记录的 fallback；首包后只上报错误并结算已知或 reserved estimated usage；不得重复真实执行请求；
 - **进程崩溃**：数据库事实可恢复；outbox/settlement worker 重新 claim；Redis 状态过期后重建。
 
 ## 7. 调度第一版

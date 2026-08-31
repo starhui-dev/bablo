@@ -33,6 +33,7 @@ type usageFixtures struct {
 	version       uuid.UUID
 	target        uuid.UUID
 	price         uuid.UUID
+	wallet        uuid.UUID
 }
 
 func openUsageTestStore(t *testing.T) *data.Store {
@@ -99,6 +100,7 @@ func seedUsageFixtures(t *testing.T, store *data.Store) usageFixtures {
 		version:       uuid.New(),
 		target:        uuid.New(),
 		price:         uuid.New(),
+		wallet:        uuid.New(),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -108,6 +110,7 @@ func seedUsageFixtures(t *testing.T, store *data.Store) usageFixtures {
 			args []any
 		}{
 			{`INSERT INTO users (id, email_normalized, password_hash, password_params_version) VALUES ($1, $2, 'test-hash', 'test')`, []any{f.user, "usage-" + f.user.String() + "@example.test"}},
+			{`INSERT INTO wallets (id, user_id, currency) VALUES ($1, $2, 'USD')`, []any{f.wallet, f.user}},
 			{`INSERT INTO api_keys (id, user_id, name, key_prefix, secret_hash) VALUES ($1, $2, 'usage-test', 'bablo_sk_usage', $3)`, []any{f.apiKey, f.user, []byte("secret-hash")}},
 			{`INSERT INTO models (id, public_model_id, display_name, billing_class) VALUES ($1, $2, 'Usage Test Model', 'token')`, []any{f.model, "usage-model-" + f.model.String()}},
 			{`INSERT INTO providers (id, slug, display_name, resource_type, commercial_allowed) VALUES ($1, $2, 'Usage Provider', 'official_api', true)`, []any{f.provider, "usage-provider-" + f.provider.String()}},
@@ -174,6 +177,7 @@ func finalizedUsageInput(f usageFixtures) FinalizeInput {
 		RouteVersionID:  &f.version,
 		CredentialID:    &f.credential,
 		PriceVersionID:  &f.price,
+		WalletID:        &f.wallet,
 		Usage:           TokenUsage{InputTokens: 12, OutputTokens: 8, CacheReadTokens: 3, ReasoningTokens: 2},
 		AmountMinor:     new(int64(17)),
 		Currency:        "USD",

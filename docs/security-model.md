@@ -2,7 +2,7 @@
 
 > 目标：生产级多用户 AI Gateway 的控制面、推理面和账务安全基线
 > 日期：2026-08-31
-> 当前状态：P0 Web Session、CSRF、RBAC、管理员 TOTP/恢复码、推理 API Key、上游 Credential AEAD/轮换、Route/Scheduler/Proxy 数据面已实现；真实上游、Usage/支付和生产安全门禁仍未放行。
+> 当前状态：P0 Web Session、CSRF、RBAC、管理员 TOTP/恢复码、推理 API Key、上游 Credential AEAD/轮换、Route/Scheduler/Proxy、不可变 Usage 与 Wallet Billing 已实现；真实上游、支付和最终生产安全门禁仍未放行。
 
 ## 1. 资产与信任边界
 
@@ -42,7 +42,7 @@
 - 身份中间件每次检查 active/revoked/expired、active owner 和 canonical CIDR IP allowlist，只信任直连 `RemoteAddr`，不信任客户端提供的 forwarded headers；上下文只放内部 user/key ID、prefix、secret version 和限额，授权阶段再次比对当前版本，使 rotate 提交前取得的陈旧 Principal 失效；
 - 推理 handler 在解析 requested model 与 token 估算后必须调用授权服务：policy default deny，显式 deny 优先、allow 次之，一个 Key 可允许多个模型；随后执行 RPM/TPM 固定 UTC 分钟窗口门禁；
 - PostgreSQL 是 Key、policy、entitlement、撤销和轮换事实源。配置 Redis 时 Lua 原子计数且错误 fail closed；未配置 Redis 只允许 P0 单实例使用有界进程内计数，不能作为 HA 方案；
-- daily/monthly budget 阈值已保存并进入 Principal，但真实消费门禁必须等 Usage/Billing 提供可核验消费事实；在此前不得假装预算已经执行；
+- daily/monthly budget 阈值进入 Principal；Billing 以 API-key advisory transaction lock 计算周期内已结算 charge + active/pending reservation，再锁 wallet 预留。Redis 不参与预算事实，余额/预算不足均在调用上游前 fail closed；
 - P0 轮换原子替换同一 Key 的 hash，旧 Key 立即失效并写 audit；不提供难以证明撤销边界的双 Key 并行窗口。
 
 ## 3. Secret 与加密
@@ -66,11 +66,15 @@
 
 ## 5. 账务、支付与防重放
 
-- PostgreSQL 是唯一事实源；UsageEvent、Wallet Ledger、PaymentEvent 追加式、不可变；
-- 钱包预留/扣费在事务中锁定 wallet 行或使用已验证的原子更新；重复 request settle、worker retry、webhook retry 都由唯一幂等键收敛；
+- PostgreSQL 是唯一事实源；UsageEvent、Wallet Ledger、PaymentEvent 追加式、不可变；CPA usage queue、Redis 和 Dashboard 聚合都不能直接入账；
+- 非零 reservation 必须绑定 owner/request、resolved route/provider/credential 和已发布且当前 effective 的 price version。数据库跨表 trigger 拒绝 wallet owner、UsageEvent wallet/request/price 或 settlement amount 不一致；
+- 金额计算使用 decimal string + 整数/`math/big`，汇总后一次向上取整到货币最小单位；禁止 float。cache/reasoning breakdown 去除总量内已包含部分，避免重复收费；
+- reservation 先串行化 API Key budget，再 `FOR UPDATE` 锁 wallet，把 available 原子转入 reserved；`wallets` 余额不得为负。重复 request/settlement/ledger retry 由服务端幂等键和唯一约束收敛；
+- `wallet_ledger.available_delta_minor` / `reserved_delta_minor` 是余额重建权威，balance-after snapshot 用于审计。数据库 trigger 以 SQLSTATE `55000` 拒绝 UPDATE/DELETE；
+- settle 少于预留只追加 release，多于预留从 available 补扣；补扣不足保留 reservation，写 pending settlement 与 outbox。missing usage 按 reservation 标记 estimated/reconcile 后结算，不能释放成免费请求；
+- recharge/refund/grant/bonus/adjustment/admin_adjustment/expiration 均追加 ledger。管理员调账要求 operator，并在同一事务写 sanitized audit；不修改历史 entry；
 - 支付 webhook 必须按 provider 当前官方规范验签，并验证 merchant/app ID、订单号、金额、币种、状态和时间窗；provider event/trade ID 唯一；
 - webhook 事务只更新订单、写 event、充值 ledger 和 outbox；客户端成功页不入账；
-- 管理员调账只新增 adjustment/grant/refund entry，不修改历史 ledger；
 - 没有真实 sandbox/商户凭据时，支付只能是 disabled、fixture 或 runbook 状态，对外标记 NO-GO。
 
 ## 6. 日志、隐私与数据最小化
@@ -89,6 +93,6 @@ Usage 只保存 token/长度/协议、模型、路由和状态元数据；Prompt
 
 ## 8. 审计与响应
 
-以下动作必须写不可变 audit：登录失败/成功、MFA 变更、Key 创建/轮换/撤销、用户/RBAC 变更、Credential 写入/禁用/轮换、route/model/price 变更、钱包 adjustment/refund、支付 webhook 验签结果、敏感 debug capture、管理员导出。记录 actor、action、target、request ID、结果和脱敏前后摘要，不记录 secret/body。
+以下动作必须写不可变 audit：登录失败/成功、MFA 变更、Key 创建/轮换/撤销、用户/RBAC 变更、Credential 写入/禁用/轮换、route/model/price 变更、wallet admin adjustment/refund、支付 webhook 验签结果、敏感 debug capture、管理员导出。记录 actor、action、target、request ID、结果和脱敏摘要，不记录 secret/body。
 
 上线前完成 API Key 泄漏、越权、CSRF/XSS、SSRF、wallet race、webhook forged/replay、日志泄密、CPA 暴露、Redis/PG 暴露和依赖漏洞演练。`Critical/High=0`、secret scan clean、备份恢复和回滚可执行，才允许进入 ship gate。

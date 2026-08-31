@@ -169,6 +169,12 @@ func normalizeFinalizeInput(handle RequestHandle, input FinalizeInput, now time.
 			return FinalizeInput{}, fmt.Errorf("%w: currency must be three uppercase ASCII letters", ErrInvalidInput)
 		}
 	}
+	if (input.AmountMinor == nil) != (input.Currency == "") {
+		return FinalizeInput{}, fmt.Errorf("%w: amount and currency must be provided together", ErrInvalidInput)
+	}
+	if input.AmountMinor != nil && *input.AmountMinor > 0 && input.WalletID == nil {
+		return FinalizeInput{}, fmt.Errorf("%w: a positive charge requires a wallet", ErrInvalidInput)
+	}
 	if input.Latency < 0 {
 		return FinalizeInput{}, fmt.Errorf("%w: latency must not be negative", ErrInvalidInput)
 	}
@@ -197,6 +203,7 @@ func normalizeFinalizeInput(handle RequestHandle, input FinalizeInput, now time.
 	input.RouteVersionID = normalizeUUIDPtr(input.RouteVersionID)
 	input.CredentialID = normalizeUUIDPtr(input.CredentialID)
 	input.PriceVersionID = normalizeUUIDPtr(input.PriceVersionID)
+	input.WalletID = normalizeUUIDPtr(input.WalletID)
 	input.AmountMinor = cloneInt64Ptr(input.AmountMinor)
 	input.UpstreamStatus = cloneIntPtr(input.UpstreamStatus)
 	if input.UpstreamStatus != nil && (*input.UpstreamStatus < 100 || *input.UpstreamStatus > 599) {

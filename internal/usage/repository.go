@@ -143,7 +143,7 @@ func (r *Repository) Finalize(ctx context.Context, handle RequestHandle, input F
             INSERT INTO usage_events (
                 id, settlement_key, request_record_id, request_id, user_id, api_key_id,
                 requested_model, started_at, finished_at, resolved_model_id, provider_id, provider_model_id,
-                route_version_id, credential_id, price_version_id, input_tokens,
+                route_version_id, credential_id, price_version_id, wallet_id, input_tokens,
                 output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
                 amount_minor, currency, estimated, provenance, terminal_status,
                 upstream_status, error_class, latency_ms, ttft_ms, created_at
@@ -151,7 +151,7 @@ func (r *Repository) Finalize(ctx context.Context, handle RequestHandle, input F
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-                $25, $26, $27, $28, $29, $30
+                $25, $26, $27, $28, $29, $30, $31
             )
             RETURNING created_at`,
 			event.ID,
@@ -169,6 +169,7 @@ func (r *Repository) Finalize(ctx context.Context, handle RequestHandle, input F
 			uuidPtrArg(event.RouteVersionID),
 			uuidPtrArg(event.CredentialID),
 			uuidPtrArg(event.PriceVersionID),
+			uuidPtrArg(event.WalletID),
 			event.Usage.InputTokens,
 			event.Usage.OutputTokens,
 			event.Usage.CacheReadTokens,
@@ -434,7 +435,7 @@ func scanRequestRecord(row interface{ Scan(...any) error }) (RequestHandle, erro
 const usageEventColumns = `
  id, settlement_key, request_record_id, request_id, user_id, api_key_id,
  requested_model, started_at, finished_at, resolved_model_id, provider_id, provider_model_id,
- route_version_id, credential_id, price_version_id, input_tokens,
+ route_version_id, credential_id, price_version_id, wallet_id, input_tokens,
  output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
  amount_minor, currency, estimated, provenance, terminal_status,
  upstream_status, error_class, latency_ms, ttft_ms, created_at`
@@ -449,7 +450,7 @@ func loadUsageEventByRequestID(ctx context.Context, q data.Querier, requestID st
 
 func scanUsageEvent(row interface{ Scan(...any) error }) (Event, error) {
 	var result Event
-	var requestRecordID, userID, apiKeyID, resolvedModelID, providerID, providerModelID, routeVersionID, credentialID, priceVersionID pgtype.UUID
+	var requestRecordID, userID, apiKeyID, resolvedModelID, providerID, providerModelID, routeVersionID, credentialID, priceVersionID, walletID pgtype.UUID
 	var startedAt, finishedAt pgtype.Timestamptz
 	var amountMinor, latencyMS, ttftMS pgtype.Int8
 	var currency, errorClass pgtype.Text
@@ -470,6 +471,7 @@ func scanUsageEvent(row interface{ Scan(...any) error }) (Event, error) {
 		&routeVersionID,
 		&credentialID,
 		&priceVersionID,
+		&walletID,
 		&result.Usage.InputTokens,
 		&result.Usage.OutputTokens,
 		&result.Usage.CacheReadTokens,
@@ -503,6 +505,7 @@ func scanUsageEvent(row interface{ Scan(...any) error }) (Event, error) {
 	result.RouteVersionID = nullableUUID(routeVersionID)
 	result.CredentialID = nullableUUID(credentialID)
 	result.PriceVersionID = nullableUUID(priceVersionID)
+	result.WalletID = nullableUUID(walletID)
 	result.AmountMinor = nullableInt64(amountMinor)
 	if currency.Valid {
 		result.Currency = currency.String
@@ -617,6 +620,7 @@ func sameEventInput(existing Event, handle RequestHandle, input FinalizeInput) b
 		equalUUIDPtr(existing.RouteVersionID, expected.RouteVersionID) &&
 		equalUUIDPtr(existing.CredentialID, expected.CredentialID) &&
 		equalUUIDPtr(existing.PriceVersionID, expected.PriceVersionID) &&
+		equalUUIDPtr(existing.WalletID, expected.WalletID) &&
 		existing.Usage == expected.Usage &&
 		equalInt64Ptr(existing.AmountMinor, expected.AmountMinor) &&
 		existing.Currency == expected.Currency &&
@@ -695,6 +699,7 @@ func eventFromFinalize(eventID uuid.UUID, key string, handle RequestHandle, inpu
 		RouteVersionID:  cloneUUIDPtr(input.RouteVersionID),
 		CredentialID:    cloneUUIDPtr(input.CredentialID),
 		PriceVersionID:  cloneUUIDPtr(input.PriceVersionID),
+		WalletID:        cloneUUIDPtr(input.WalletID),
 		Usage:           input.Usage,
 		AmountMinor:     cloneInt64Ptr(input.AmountMinor),
 		Currency:        input.Currency,

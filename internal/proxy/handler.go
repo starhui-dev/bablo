@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/starhui-dev/bablo/internal/apikey"
+	"github.com/starhui-dev/bablo/internal/billing"
 	"github.com/starhui-dev/bablo/internal/credential"
 	"github.com/starhui-dev/bablo/internal/httpapi"
 	"github.com/starhui-dev/bablo/internal/inference"
@@ -107,10 +108,11 @@ func (e endpoint) format() string {
 }
 
 type parsedRequest struct {
-	Model     string
-	Stream    bool
-	Tools     bool
-	Reasoning bool
+	Model           string
+	Stream          bool
+	Tools           bool
+	Reasoning       bool
+	MaxOutputTokens int64
 }
 
 func (h *Handler) resolvePrincipal(ctx context.Context) (apikey.Principal, bool) {
@@ -267,6 +269,7 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, e endpoint) {
 			h.logger.Error("proxy_lease_release_error", "request_id", requestID(r), "error_class", errorClass(releaseErr))
 		}
 	}()
+	var priceSnapshot pricing.Snapshot
 	if h.prices != nil {
 		providerModelID := uuidPointer(selection.Target.ProviderModelID)
 		snapshot, priceErr := h.prices.ResolveSnapshot(r.Context(), resolution.ModelID, providerModelID, h.now().UTC())
@@ -278,9 +281,45 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, e endpoint) {
 			writeProxyError(w, r, priceErr)
 			return
 		}
+		priceSnapshot = snapshot
 		if usageState != nil {
 			usageState.setPrice(snapshot)
 		}
+	}
+	if h.billing != nil {
+		if usageState == nil {
+			writeProxyError(w, r, errUsageUnavailable)
+			return
+		}
+		estimatedUsage := usage.TokenUsage{
+			InputTokens:  estimateTokens(body),
+			OutputTokens: parsed.MaxOutputTokens,
+		}
+		reservation, reserveErr := h.billing.Reserve(r.Context(), billing.ReserveInput{
+			UserID:             principal.UserID,
+			APIKeyID:           principal.APIKeyID,
+			RequestID:          requestID(r),
+			RequestRecordID:    usageRecordID(usageState),
+			ModelID:            uuidPointer(resolution.ModelID),
+			ProviderModelID:    uuidPointer(selection.Target.ProviderModelID),
+			RouteVersionID:     uuidPointer(resolution.Version.ID),
+			ProviderID:         uuidPointer(selection.Target.ProviderID),
+			CredentialID:       uuidPointer(selection.CredentialID),
+			Price:              priceSnapshot,
+			EstimatedUsage:     estimatedUsage,
+			DailyBudgetMinor:   principal.DailyBudgetMinor,
+			MonthlyBudgetMinor: principal.MonthlyBudgetMinor,
+			Reason:             "inference_budget_hold",
+		})
+		if reserveErr != nil {
+			if finalizeErr := finalizeUsageFailure(r, usageState, reserveErr); finalizeErr != nil {
+				writeProxyError(w, r, finalizeErr)
+				return
+			}
+			writeProxyError(w, r, reserveErr)
+			return
+		}
+		usageState.setReservation(reservation)
 	}
 	inferenceRequest := inference.Request{
 		RequestID: requestID(r),
@@ -326,11 +365,14 @@ func (h *Handler) readRequest(w http.ResponseWriter, r *http.Request) ([]byte, p
 		return nil, parsedRequest{}, errInvalidRequest
 	}
 	var raw struct {
-		Model           json.RawMessage `json:"model"`
-		Stream          json.RawMessage `json:"stream"`
-		Tools           json.RawMessage `json:"tools"`
-		Reasoning       json.RawMessage `json:"reasoning"`
-		ReasoningEffort json.RawMessage `json:"reasoning_effort"`
+		Model               json.RawMessage `json:"model"`
+		Stream              json.RawMessage `json:"stream"`
+		Tools               json.RawMessage `json:"tools"`
+		Reasoning           json.RawMessage `json:"reasoning"`
+		ReasoningEffort     json.RawMessage `json:"reasoning_effort"`
+		MaxTokens           json.RawMessage `json:"max_tokens"`
+		MaxCompletionTokens json.RawMessage `json:"max_completion_tokens"`
+		MaxOutputTokens     json.RawMessage `json:"max_output_tokens"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, parsedRequest{}, errInvalidRequest
@@ -350,6 +392,11 @@ func (h *Handler) readRequest(w http.ResponseWriter, r *http.Request) ([]byte, p
 	}
 	parsed.Tools = presentJSON(raw.Tools)
 	parsed.Reasoning = presentJSON(raw.Reasoning) || reasoningRequested(raw.ReasoningEffort)
+	maxOutputTokens, err := parseMaxOutputTokens(raw.MaxTokens, raw.MaxCompletionTokens, raw.MaxOutputTokens)
+	if err != nil {
+		return nil, parsedRequest{}, errInvalidRequest
+	}
+	parsed.MaxOutputTokens = maxOutputTokens
 	return body, parsed, nil
 }
 
@@ -367,6 +414,24 @@ func reasoningRequested(value json.RawMessage) bool {
 		return false
 	}
 	return true
+}
+
+func parseMaxOutputTokens(values ...json.RawMessage) (int64, error) {
+	var maximum int64
+	for _, raw := range values {
+		raw = bytes.TrimSpace(raw)
+		if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+			continue
+		}
+		var value int64
+		if err := json.Unmarshal(raw, &value); err != nil || value <= 0 {
+			return 0, errInvalidRequest
+		}
+		if value > maximum {
+			maximum = value
+		}
+	}
+	return maximum, nil
 }
 
 func requiredCapabilities(e endpoint, request parsedRequest) catalogmodel.Capabilities {
@@ -786,6 +851,20 @@ func mapPublicError(err error) mappedError {
 		return mappedError{status: http.StatusBadRequest, typeName: "invalid_request_error", code: "invalid_request", message: "The request is invalid."}
 	case errors.Is(err, scheduler.ErrLeaseBusy):
 		return mappedError{status: http.StatusServiceUnavailable, typeName: "upstream_error", code: "no_eligible_credential", message: "No eligible upstream credential is available."}
+	case errors.Is(err, billing.ErrInsufficientFunds):
+		return mappedError{status: http.StatusPaymentRequired, typeName: "billing_error", code: "insufficient_funds", message: "The wallet has insufficient funds."}
+	case errors.Is(err, billing.ErrBudgetExceeded):
+		return mappedError{status: http.StatusPaymentRequired, typeName: "billing_error", code: "budget_exceeded", message: "The API key budget has been exceeded."}
+	case errors.Is(err, billing.ErrWalletFrozen):
+		return mappedError{status: http.StatusForbidden, typeName: "billing_error", code: "wallet_unavailable", message: "The wallet is unavailable."}
+	case errors.Is(err, billing.ErrSettlementPending):
+		return mappedError{status: http.StatusServiceUnavailable, typeName: "billing_error", code: "settlement_pending", message: "Usage settlement is pending reconciliation.", retryAfter: "60"}
+	case errors.Is(err, billing.ErrPriceMissing):
+		return mappedError{status: http.StatusServiceUnavailable, typeName: "billing_error", code: "price_unavailable", message: "Pricing is temporarily unavailable."}
+	case errors.Is(err, billing.ErrInvalidInput):
+		return mappedError{status: http.StatusBadRequest, typeName: "invalid_request_error", code: "invalid_request", message: "The request is invalid."}
+	case errors.Is(err, billing.ErrReservationConflict), errors.Is(err, billing.ErrSettlementConflict), errors.Is(err, billing.ErrBalanceOverflow):
+		return mappedError{status: http.StatusServiceUnavailable, typeName: "billing_error", code: "billing_unavailable", message: "Billing is temporarily unavailable."}
 	case errors.Is(err, errMalformedResponse), errors.Is(err, errEmptyStream), errors.Is(err, errStreamIncomplete):
 		return mappedError{status: http.StatusBadGateway, typeName: "upstream_error", code: "upstream_protocol_error", message: "The upstream response was incomplete or invalid."}
 	case errors.Is(err, errInvalidRequest):

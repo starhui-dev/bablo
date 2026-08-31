@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/starhui-dev/bablo/internal/apikey"
+	"github.com/starhui-dev/bablo/internal/billing"
 	"github.com/starhui-dev/bablo/internal/inference"
 	"github.com/starhui-dev/bablo/internal/pricing"
 	"github.com/starhui-dev/bablo/internal/route"
@@ -21,6 +22,7 @@ var errUsageUnavailable = errors.New("usage persistence is unavailable")
 
 type requestUsageState struct {
 	recorder UsageRecorder
+	billing  BillingCoordinator
 	handle   usage.RequestHandle
 	started  time.Time
 
@@ -31,8 +33,10 @@ type requestUsageState struct {
 	credentialID    *uuid.UUID
 	selected        bool
 
+	price          pricing.Snapshot
 	priceVersionID *uuid.UUID
 	currency       string
+	reservation    *billing.Reservation
 	done           bool
 }
 
@@ -69,7 +73,7 @@ func (h *Handler) beginUsage(ctx context.Context, r *http.Request, principal api
 	if handle.TerminalStatus != "" {
 		return nil, fmt.Errorf("%w: request %s is already %s", usage.ErrRequestAlreadyClosed, handle.RequestID, handle.TerminalStatus)
 	}
-	return &requestUsageState{recorder: h.usage, handle: handle, started: started}, nil
+	return &requestUsageState{recorder: h.usage, billing: h.billing, handle: handle, started: started}, nil
 }
 
 func (s *requestUsageState) requestRecordID() *uuid.UUID {
@@ -114,6 +118,23 @@ func (s *requestUsageState) setPrice(snapshot pricing.Snapshot) {
 		s.priceVersionID = uuidPointer(snapshot.VersionID)
 	}
 	s.currency = snapshot.Currency
+	s.price = clonePriceSnapshot(snapshot)
+}
+
+func (s *requestUsageState) setReservation(reservation billing.Reservation) {
+	if s == nil {
+		return
+	}
+	copy := reservation
+	copy.APIKeyID = cloneUUID(reservation.APIKeyID)
+	copy.RequestRecordID = cloneUUID(reservation.RequestRecordID)
+	copy.ModelID = cloneUUID(reservation.ModelID)
+	copy.ProviderModelID = cloneUUID(reservation.ProviderModelID)
+	copy.RouteVersionID = cloneUUID(reservation.RouteVersionID)
+	copy.ProviderID = cloneUUID(reservation.ProviderID)
+	copy.CredentialID = cloneUUID(reservation.CredentialID)
+	copy.UsageEventID = cloneUUID(reservation.UsageEventID)
+	s.reservation = &copy
 }
 
 func (s *requestUsageState) finalize(ctx context.Context, completion usageCompletion) error {
@@ -157,6 +178,28 @@ func (s *requestUsageState) finalize(ctx context.Context, completion usageComple
 			StartedAt:       s.started,
 		}
 	}
+	var amountMinor *int64
+	var walletID *uuid.UUID
+	currency := ""
+	estimated := false
+	if s.billing != nil && s.priceVersionID != nil {
+		if !completion.usageFound && s.reservation != nil && s.reservation.Status != billing.ReservationNone {
+			value := s.reservation.AmountMinor
+			amountMinor = &value
+			estimated = true
+		} else {
+			quote, quoteErr := s.billing.Quote(s.price, completion.observed)
+			if quoteErr != nil {
+				return fmt.Errorf("%w: calculate usage charge: %v", errUsageUnavailable, quoteErr)
+			}
+			value := quote.AmountMinor
+			amountMinor = &value
+		}
+		currency = s.currency
+		if s.reservation != nil && s.reservation.Status != billing.ReservationNone {
+			walletID = uuidPointer(s.reservation.WalletID)
+		}
+	}
 	input := usage.FinalizeInput{
 		Attempt:         attempt,
 		ResolvedModelID: cloneUUID(s.resolvedModelID),
@@ -165,8 +208,11 @@ func (s *requestUsageState) finalize(ctx context.Context, completion usageComple
 		RouteVersionID:  cloneUUID(s.routeVersionID),
 		CredentialID:    cloneUUID(s.credentialID),
 		PriceVersionID:  cloneUUID(s.priceVersionID),
+		WalletID:        cloneUUID(walletID),
 		Usage:           completion.observed,
-		Currency:        s.currency,
+		AmountMinor:     amountMinor,
+		Currency:        currency,
+		Estimated:       estimated,
 		Provenance:      provenance,
 		TerminalStatus:  status,
 		UpstreamStatus:  upstreamStatus,
@@ -178,9 +224,15 @@ func (s *requestUsageState) finalize(ctx context.Context, completion usageComple
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	_, err := s.recorder.Finalize(context.WithoutCancel(ctx), s.handle, input)
+	event, err := s.recorder.Finalize(context.WithoutCancel(ctx), s.handle, input)
 	if err != nil {
 		return fmt.Errorf("%w: finalize usage event: %v", errUsageUnavailable, err)
+	}
+	if s.billing != nil && s.reservation != nil && s.reservation.Status != billing.ReservationNone && s.reservation.Status != billing.ReservationReleased {
+		_, settleErr := s.billing.Settle(context.WithoutCancel(ctx), billing.SettleInput{ReservationID: s.reservation.ID, Event: event})
+		if settleErr != nil && !errors.Is(settleErr, billing.ErrSettlementPending) {
+			return fmt.Errorf("%w: settle usage event: %v", errUsageUnavailable, settleErr)
+		}
 	}
 	s.done = true
 	return nil
@@ -236,4 +288,15 @@ func cloneDuration(value *time.Duration) *time.Duration {
 	}
 	copy := *value
 	return &copy
+}
+
+func clonePriceSnapshot(snapshot pricing.Snapshot) pricing.Snapshot {
+	copy := snapshot
+	if snapshot.Prices != nil {
+		copy.Prices = make(map[string]string, len(snapshot.Prices))
+		for dimension, value := range snapshot.Prices {
+			copy.Prices[dimension] = value
+		}
+	}
+	return copy
 }

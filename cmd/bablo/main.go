@@ -11,6 +11,7 @@ import (
 
 	"github.com/starhui-dev/bablo/internal/apikey"
 	"github.com/starhui-dev/bablo/internal/auth"
+	"github.com/starhui-dev/bablo/internal/billing"
 	"github.com/starhui-dev/bablo/internal/config"
 	"github.com/starhui-dev/bablo/internal/data"
 	"github.com/starhui-dev/bablo/internal/httpapi"
@@ -202,6 +203,16 @@ func run(arguments []string) int {
 				logger.Error("bablo_usage_service_error", "error", usageErr)
 				return 1
 			}
+			billingRepository, billingErr := billing.NewRepository(store)
+			if billingErr != nil {
+				logger.Error("bablo_billing_repository_error", "error", billingErr)
+				return 1
+			}
+			billingService, billingErr := billing.NewService(billingRepository)
+			if billingErr != nil {
+				logger.Error("bablo_billing_service_error", "error", billingErr)
+				return 1
+			}
 
 			cpaAdapter, err = cpa.NewService(cpa.ServiceOptions{ConfigPath: cfg.CPAConfigPath})
 			if err != nil {
@@ -241,6 +252,7 @@ func run(arguments []string) int {
 				UsageRecorder:   usageService,
 				PriceResolver:   catalog.pricingService,
 				Logger:          logger,
+				Billing:         billingService,
 			})
 			if handlerErr != nil {
 				logger.Error("bablo_proxy_handler_error", "error", handlerErr)
