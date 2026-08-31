@@ -46,7 +46,7 @@ erDiagram
     CREDENTIALS ||--o{ QUOTA_SNAPSHOTS : observed
     CREDENTIALS ||--|| CREDENTIAL_HEALTH : reports
     REQUEST_RECORDS ||--o{ REQUEST_ATTEMPTS : includes
-    REQUEST_RECORDS ||--o{ USAGE_EVENTS : settles
+    REQUEST_RECORDS ||--o| USAGE_EVENTS : settles
     REQUEST_RECORDS ||--o{ SCHEDULER_DECISIONS : explains
 ```
 
@@ -84,8 +84,7 @@ erDiagram
 
 - `request_records`：`request_id`, user, API key, endpoint, requested model, stream flag, started/finished, terminal status；不存正文；
 - `request_attempts`：request、attempt_no、route version、provider、credential、upstream status/error、latency/TTFT、started/finished；用于 fallback 与排障；
-- `usage_events`：不可变结算事实，包含 request/user/key、requested/resolved model、provider/route version/credential、price version、token breakdown、status/error、latency/TTFT、estimated/provenance、settlement key；
-- `usage_reconciliations`：CPA usage signal/迟到 usage/估算修正与差异，不覆盖原始 UsageEvent；
+- `usage_events`：不可变结算事实，每个逻辑 `request_id` 至多一条，包含 request/user/key、requested/resolved model、provider/provider model/route version/credential、price version、started/finished、token breakdown、status/error、latency/TTFT、estimated/provenance、settlement key；`request_record_id` 若存在必须与 `request_id` 对应，`usage_reconciliations` 只追加迟到差异，不覆盖原始事件。
 - `scheduler_decisions`：request/attempt、候选内部 ID、排除原因、score/priority、selected、fallback chain、strategy version；JSON 只含非敏感 metadata；
 
 - `scheduler_decisions` 的选中字段同时保存 route version、target、provider、credential；新决策必须满足三者成组一致，历史仅有 target 的记录保持可读。`credentials.max_concurrency` 为 1–10000；Redis 仅保存带 TTL 的 lease、cursor、affinity，不是事实源。
@@ -116,14 +115,14 @@ erDiagram
 | public model/alias | `lower(public_model_id)`、`lower(alias)` 各自唯一且跨表互斥；禁用 alias 仍保留占位 |
 | price version | `(scope, version_no)`；同一 scope 的 published effective intervals 不重叠 |
 | price | `(price_version_id, pricing_scope, target, dimension)`；同一版本目标维度唯一 |
-| request | `request_id` |
-| usage settle | `settlement_key`（建议 logical request + terminal settlement version）；重复 finalize 返回已有结果 |
+| request | `request_id`；若已有 request 记录，重试必须 metadata 完全一致 |
+| usage settle | `settlement_key` 与 `request_id` 均唯一；P0 由服务端派生 `usage:v1:<request_id>`，重复 finalize 返回已有结果 |
 | wallet ledger | `(wallet_id, idempotency_key)`；充值/扣费 reference 另加唯一约束 |
 | payment order | `order_no`；外部 trade no 在 provider scope 内唯一 |
 | payment event | `(payment_provider, provider_event_id)`；防重放 |
 | scheduler decision | `(request_id, attempt_no, decision_no)` |
 | audit | `event_id` 或 `(request_id, actor, action, target, nonce)` 按实现选定 |
-| outbox | `(aggregate_type, aggregate_id, event_type, idempotency_key)` |
+| outbox | `(aggregate_type, aggregate_id, event_type, idempotency_key)`；processing claim 绑定 `claimed_by` owner token |
 
 所有幂等键必须由服务端生成或从受信任的 provider event/request identity 派生，不能接受客户端任意覆盖账务事实。
 
@@ -151,10 +150,12 @@ Raw Usage、scheduler/audit、payment payload hash 和 rollup 的 retention 必�
 - `migrations/000007_credential_security.sql` 增加 Credential runtime metadata、source-kind/secret ciphertext/key/rotation 约束、source identity guard、secret history append-only、pool identity guard 和 active-secret 索引。
 - `migrations/000008_route_integrity.sql` 增加 Route match/hash/metadata 约束；Route version 仅允许一次性关闭，Route target immutable，所有新 target 集合必须通过新 version 发布。
 - `migrations/000009_scheduler_integrity.sql` 增加 Credential 并发容量约束、Scheduler 决策选中路由/provider/credential 关联字段、历史兼容约束和数据库选择一致性 trigger；Scheduler 运行态仍由 Redis TTL 状态协调。
+- `migrations/000010_usage_integrity.sql` 增加 Usage `request_id` 唯一索引、started/finished 时间快照、request-record 关联与 settlement/request/source/claim-owner 输入约束；从 v9 回填历史 Usage 时间并恢复 append-only trigger，outbox claim/retry/publish 由 `internal/usage` 以 owner token 和 stale lease 实现。
 - `internal/model` 实现 canonical ID/alias 解析、public/admin 列表、能力/visibility/billing class 校验和 route readiness；alias 禁用后不被重新分配。
 - `internal/provider` 实现资源政策、上游模型映射和完整 discovery snapshot reconcile；新增发现 pending/disabled，缺失只改变 discovery signal，批准配置不被发现覆盖。
 - `internal/credential` 实现 non-secret DTO、AES-GCM secret create/rotate/reencrypt、active runtime source、monotonic health、Provider pool membership 和 opaque composite cursor；管理员 API 永不返回 secret value。
 - `internal/pricing` 使用 decimal string + `numeric(30,12)`，实现 draft/activate/retire 与 provider_model -> model -> global 价格解析；缺价/禁用计费 fail closed。
 - `internal/route` 实现 P0 exact route、多 Provider/Pool candidate、snapshot hash、active version 原子切换、opaque cursor、preview/resolution 和管理员 API；resolver 只产出 scheduler candidates，不选择 Credential。
 - `internal/scheduler` 实现 target/member 硬过滤、429 cooldown、quota freshness/reset、priority/fill-first/round-robin/weighted-round-robin/quota-aware、有限 affinity、Redis/内存 TTL lease/cursor/affinity 和 immutable Decision Log；它只接收 Route resolution，不暴露 CPA 类型。
+- `internal/usage` 实现 request record 幂等、immutable UsageEvent、stream/cancel/no-usage 状态、late reconciliation、transactional outbox claim/ack/retry；Proxy 只提交领域输入，不暴露 CPA 类型或正文。
 - `cmd/bablo/catalog.go` 将用户模型目录和 admin model/provider/price/route handlers 接入 Web Session/RBAC；`Store.WithTx` 保持 repository 事务边界，应用启动不自动迁移。

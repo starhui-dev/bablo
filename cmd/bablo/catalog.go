@@ -18,6 +18,7 @@ import (
 type catalogRuntime struct {
 	options           []httpapi.Option
 	modelService      *model.Service
+	pricingService    *pricing.Service
 	routeService      *route.Service
 	credentialService *credential.Service
 }
@@ -60,8 +61,9 @@ func newCatalogRuntime(store *data.Store, authHandler *auth.Handler, credentialK
 	}
 
 	runtime := &catalogRuntime{
-		modelService: modelService,
-		routeService: routeService,
+		modelService:   modelService,
+		pricingService: pricingService,
+		routeService:   routeService,
 	}
 	if credentialKeys != nil {
 		credentialRepository, err := credential.NewRepository(store, credentialKeys)

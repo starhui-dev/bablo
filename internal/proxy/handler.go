@@ -21,9 +21,11 @@ import (
 	"github.com/starhui-dev/bablo/internal/httpapi"
 	"github.com/starhui-dev/bablo/internal/inference"
 	catalogmodel "github.com/starhui-dev/bablo/internal/model"
+	"github.com/starhui-dev/bablo/internal/pricing"
 	"github.com/starhui-dev/bablo/internal/provider"
 	"github.com/starhui-dev/bablo/internal/route"
 	"github.com/starhui-dev/bablo/internal/scheduler"
+	"github.com/starhui-dev/bablo/internal/usage"
 )
 
 var (
@@ -210,18 +212,35 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, e endpoint) {
 		writeProxyError(w, r, err)
 		return
 	}
+	usageState, err := h.beginUsage(r.Context(), r, principal, e, parsed)
+	if err != nil {
+		writeProxyError(w, r, err)
+		return
+	}
 	if h.routes == nil || h.scheduler == nil || h.engine == nil {
+		if finalizeErr := finalizeUsageFailure(r, usageState, errInferenceUnavailable); finalizeErr != nil {
+			writeProxyError(w, r, finalizeErr)
+			return
+		}
 		writeProxyError(w, r, errInferenceUnavailable)
 		return
 	}
 	resolution, err := h.routes.Resolve(r.Context(), publicModel.PublicID)
 	if err != nil {
+		if finalizeErr := finalizeUsageFailure(r, usageState, err); finalizeErr != nil {
+			writeProxyError(w, r, finalizeErr)
+			return
+		}
 		writeProxyError(w, r, err)
 		return
+	}
+	if usageState != nil {
+		usageState.setResolution(resolution)
 	}
 	required := requiredCapabilities(e, parsed)
 	selection, err := h.scheduler.Select(r.Context(), scheduler.Request{
 		RequestID:            requestID(r),
+		RequestRecordID:      usageRecordID(usageState),
 		Resolution:           resolution,
 		Protocol:             e.protocol(),
 		RequiredCapabilities: required,
@@ -230,8 +249,15 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, e endpoint) {
 		Now:                  h.now().UTC(),
 	})
 	if err != nil {
+		if finalizeErr := finalizeUsageFailure(r, usageState, err); finalizeErr != nil {
+			writeProxyError(w, r, finalizeErr)
+			return
+		}
 		writeProxyError(w, r, err)
 		return
+	}
+	if usageState != nil {
+		usageState.setSelection(selection)
 	}
 	keeper := newLeaseKeeper(&selection, h.leaseTTL, h.logger)
 	keeper.Start()
@@ -241,7 +267,21 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, e endpoint) {
 			h.logger.Error("proxy_lease_release_error", "request_id", requestID(r), "error_class", errorClass(releaseErr))
 		}
 	}()
-
+	if h.prices != nil {
+		providerModelID := uuidPointer(selection.Target.ProviderModelID)
+		snapshot, priceErr := h.prices.ResolveSnapshot(r.Context(), resolution.ModelID, providerModelID, h.now().UTC())
+		if priceErr != nil {
+			if finalizeErr := finalizeUsageFailure(r, usageState, priceErr); finalizeErr != nil {
+				writeProxyError(w, r, finalizeErr)
+				return
+			}
+			writeProxyError(w, r, priceErr)
+			return
+		}
+		if usageState != nil {
+			usageState.setPrice(snapshot)
+		}
+	}
 	inferenceRequest := inference.Request{
 		RequestID: requestID(r),
 		ResolvedRoute: inference.ResolvedRoute{
@@ -264,10 +304,10 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, e endpoint) {
 		Stream: parsed.Stream,
 	}
 	if parsed.Stream {
-		h.executeStream(w, r, e, principal, selection, inferenceRequest)
+		h.executeStream(w, r, e, principal, selection, inferenceRequest, usageState)
 		return
 	}
-	h.executeJSON(w, r, principal, selection, inferenceRequest)
+	h.executeJSON(w, r, principal, selection, inferenceRequest, usageState)
 }
 func (h *Handler) readRequest(w http.ResponseWriter, r *http.Request) ([]byte, parsedRequest, error) {
 	if r.Body == nil {
@@ -357,10 +397,15 @@ func estimateTokens(body []byte) int64 {
 	return value
 }
 
-func (h *Handler) executeJSON(w http.ResponseWriter, r *http.Request, _ apikey.Principal, selection scheduler.Selection, request inference.Request) {
+func (h *Handler) executeJSON(w http.ResponseWriter, r *http.Request, _ apikey.Principal, selection scheduler.Selection, request inference.Request, usageState *requestUsageState) {
 	result, err := h.engine.Execute(r.Context(), request)
 	if err != nil {
+		finalizeErr := finalizeUsageFailure(r, usageState, err)
 		h.reportResult(r.Context(), selection, err)
+		if finalizeErr != nil {
+			writeProxyError(w, r, finalizeErr)
+			return
+		}
 		writeProxyError(w, r, err)
 		return
 	}
@@ -368,17 +413,28 @@ func (h *Handler) executeJSON(w http.ResponseWriter, r *http.Request, _ apikey.P
 	if status == 0 {
 		status = http.StatusOK
 	}
+	observedUsage, usageFound := usage.ExtractJSON(result.Body)
 	if status < 200 || status >= 300 || len(bytes.TrimSpace(result.Body)) == 0 || !json.Valid(result.Body) {
 		if status < 200 || status >= 300 {
 			err = &inference.UpstreamError{Class: "upstream_response", HTTPStatus: status}
 		} else {
 			err = errMalformedResponse
 		}
+		finalizeErr := finalizeUsage(r, usageState, usageCompletion{err: err, observed: observedUsage, usageFound: usageFound})
 		h.reportResult(r.Context(), selection, err)
+		if finalizeErr != nil {
+			writeProxyError(w, r, finalizeErr)
+			return
+		}
 		writeProxyError(w, r, err)
 		return
 	}
+	finalizeErr := finalizeUsage(r, usageState, usageCompletion{observed: observedUsage, usageFound: usageFound})
 	h.reportResult(r.Context(), selection, nil)
+	if finalizeErr != nil {
+		writeProxyError(w, r, finalizeErr)
+		return
+	}
 	writeSafeResponseHeaders(w, result.Headers)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
@@ -386,34 +442,80 @@ func (h *Handler) executeJSON(w http.ResponseWriter, r *http.Request, _ apikey.P
 	_, _ = w.Write(result.Body)
 }
 
-func (h *Handler) executeStream(w http.ResponseWriter, r *http.Request, e endpoint, _ apikey.Principal, selection scheduler.Selection, request inference.Request) {
+func (h *Handler) executeStream(w http.ResponseWriter, r *http.Request, e endpoint, _ apikey.Principal, selection scheduler.Selection, request inference.Request, usageState *requestUsageState) {
 	stream, err := h.engine.ExecuteStream(r.Context(), request)
 	if err != nil {
+		finalizeErr := finalizeUsageFailure(r, usageState, err)
 		h.reportResult(r.Context(), selection, err)
+		if finalizeErr != nil {
+			writeProxyError(w, r, finalizeErr)
+			return
+		}
 		writeProxyError(w, r, err)
 		return
 	}
 	outcome := h.writeStream(w, r, e, stream)
+	finalizeErr := finalizeUsage(r, usageState, usageCompletion{
+		err:        outcome.err,
+		cancelled:  outcome.cancelled,
+		observed:   outcome.observed,
+		usageFound: outcome.usageFound,
+		ttft:       outcome.ttft,
+	})
 	if outcome.cancelled {
+		if finalizeErr != nil {
+			h.logger.Error("proxy_usage_finalize_error", "request_id", requestID(r), "error_class", errorClass(finalizeErr))
+		}
 		return
 	}
 	if outcome.err != nil {
 		h.reportResult(r.Context(), selection, outcome.err)
+		if finalizeErr != nil {
+			if outcome.wroteHeaders {
+				writeSSEError(w, r, finalizeErr)
+			} else {
+				writeProxyError(w, r, finalizeErr)
+			}
+			return
+		}
 		if !outcome.wroteHeaders {
 			writeProxyError(w, r, outcome.err)
 		}
 		return
 	}
 	h.reportResult(r.Context(), selection, nil)
+	if finalizeErr != nil {
+		if outcome.wroteHeaders {
+			writeSSEError(w, r, finalizeErr)
+		} else {
+			writeProxyError(w, r, finalizeErr)
+		}
+	}
 }
 
 type streamOutcome struct {
 	err          error
 	cancelled    bool
 	wroteHeaders bool
+	observed     usage.TokenUsage
+	usageFound   bool
+	ttft         *time.Duration
 }
 
 func (h *Handler) writeStream(w http.ResponseWriter, r *http.Request, e endpoint, stream inference.Stream) (outcome streamOutcome) {
+	streamStarted := time.Now()
+	var accumulator usage.Accumulator
+	var firstPayloadAt time.Time
+	defer func() {
+		outcome.observed, outcome.usageFound = accumulator.Value()
+		if !firstPayloadAt.IsZero() {
+			ttft := firstPayloadAt.Sub(streamStarted)
+			if ttft < 0 {
+				ttft = 0
+			}
+			outcome.ttft = &ttft
+		}
+	}()
 	if stream == nil {
 		return streamOutcome{err: errEmptyStream}
 	}
@@ -430,6 +532,10 @@ func (h *Handler) writeStream(w http.ResponseWriter, r *http.Request, e endpoint
 	for {
 		event, err := stream.Next(r.Context())
 		if len(event.Payload) > 0 {
+			accumulator.Observe(event.Payload)
+			if firstPayloadAt.IsZero() {
+				firstPayloadAt = time.Now()
+			}
 			if !wroteHeaders {
 				writeSafeResponseHeaders(w, stream.Headers())
 				w.Header().Set("Content-Type", "text/event-stream")
@@ -640,6 +746,12 @@ func mapPublicError(err error) mappedError {
 	switch {
 	case errors.Is(err, errInferenceUnavailable):
 		return mappedError{status: http.StatusServiceUnavailable, typeName: "api_error", code: "inference_unavailable", message: "Inference service is not configured."}
+	case errors.Is(err, errUsageUnavailable):
+		return mappedError{status: http.StatusServiceUnavailable, typeName: "api_error", code: "usage_unavailable", message: "Usage settlement is temporarily unavailable."}
+	case errors.Is(err, usage.ErrRequestAlreadyClosed):
+		return mappedError{status: http.StatusConflict, typeName: "invalid_request_error", code: "duplicate_request", message: "The request id has already been finalized."}
+	case errors.Is(err, pricing.ErrPriceMissing), errors.Is(err, pricing.ErrBillingDisabled):
+		return mappedError{status: http.StatusServiceUnavailable, typeName: "api_error", code: "price_unavailable", message: "The model price is not currently available."}
 	case errors.Is(err, errStreamingUnsupported):
 		return mappedError{status: http.StatusNotImplemented, typeName: "api_error", code: "streaming_unavailable", message: "Streaming is not available."}
 	case errors.Is(err, errClientCancelled):

@@ -20,9 +20,11 @@ import (
 	"github.com/starhui-dev/bablo/internal/credential"
 	"github.com/starhui-dev/bablo/internal/inference"
 	catalogmodel "github.com/starhui-dev/bablo/internal/model"
+	"github.com/starhui-dev/bablo/internal/pricing"
 	"github.com/starhui-dev/bablo/internal/provider"
 	"github.com/starhui-dev/bablo/internal/route"
 	"github.com/starhui-dev/bablo/internal/scheduler"
+	"github.com/starhui-dev/bablo/internal/usage"
 )
 
 type proxyAuthorizeCall struct {
@@ -249,6 +251,75 @@ func (f *fakeProxyRuntime) MarkCredentialResult(_ context.Context, result infere
 	f.mu.Unlock()
 }
 
+type fakeProxyUsage struct {
+	mu            sync.Mutex
+	handle        usage.RequestHandle
+	beginErr      error
+	finalizeErr   error
+	begins        []usage.StartInput
+	finalizations []usage.FinalizeInput
+}
+
+func (f *fakeProxyUsage) BeginRequest(_ context.Context, input usage.StartInput) (usage.RequestHandle, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.begins = append(f.begins, input)
+	if f.beginErr != nil {
+		return usage.RequestHandle{}, f.beginErr
+	}
+	if f.handle.RecordID == uuid.Nil {
+		f.handle = usage.RequestHandle{
+			RecordID:       uuid.MustParse("aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"),
+			RequestID:      input.RequestID,
+			UserID:         input.UserID,
+			APIKeyID:       input.APIKeyID,
+			Endpoint:       input.Endpoint,
+			RequestedModel: input.RequestedModel,
+			Stream:         input.Stream,
+			StartedAt:      input.StartedAt,
+		}
+	}
+	return f.handle, nil
+}
+
+func (f *fakeProxyUsage) Finalize(_ context.Context, _ usage.RequestHandle, input usage.FinalizeInput) (usage.Event, error) {
+	f.mu.Lock()
+	f.finalizations = append(f.finalizations, input)
+	f.mu.Unlock()
+	if f.finalizeErr != nil {
+		return usage.Event{}, f.finalizeErr
+	}
+	return usage.Event{ID: uuid.MustParse("bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb")}, nil
+}
+
+func (f *fakeProxyUsage) RecordReconciliation(_ context.Context, _ usage.ReconciliationInput) (usage.Reconciliation, error) {
+	return usage.Reconciliation{}, nil
+}
+
+type fakeProxyPrices struct {
+	snapshot  pricing.Snapshot
+	err       error
+	mu        sync.Mutex
+	modelIDs  []uuid.UUID
+	targetIDs []*uuid.UUID
+}
+
+func (f *fakeProxyPrices) ResolveSnapshot(_ context.Context, modelID uuid.UUID, providerModelID *uuid.UUID, _ time.Time) (pricing.Snapshot, error) {
+	f.mu.Lock()
+	f.modelIDs = append(f.modelIDs, modelID)
+	if providerModelID == nil {
+		f.targetIDs = append(f.targetIDs, nil)
+	} else {
+		value := *providerModelID
+		f.targetIDs = append(f.targetIDs, &value)
+	}
+	f.mu.Unlock()
+	if f.err != nil {
+		return pricing.Snapshot{}, f.err
+	}
+	return f.snapshot, nil
+}
+
 type proxyStreamStep struct {
 	event inference.StreamEvent
 	err   error
@@ -449,6 +520,164 @@ func TestHandlerChatJSONRunsAuthenticatedRouteSchedulerEnginePipeline(t *testing
 	}
 	if len(runtime.results) != 1 || !runtime.results[0].Succeeded || len(health.inputs) != 1 || !health.inputs[0].Succeeded {
 		t.Fatalf("health/runtime success = %#v / %#v", health.inputs, runtime.results)
+	}
+}
+func TestHandlerRecordsResolvedUsageFact(t *testing.T) {
+	handler, _, _, _, schedulerService, engine, _, _, _ := newProxyFixture(t)
+	recorder := &fakeProxyUsage{}
+	handler.usage = recorder
+	engine.result = inference.ExecutionResult{
+		StatusCode: http.StatusOK,
+		Body:       []byte(`{"id":"chatcmpl-usage","usage":{"prompt_tokens":12,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":3}}}`),
+	}
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"model":"bablo-chat"}`))
+	request.Header.Set("X-Request-ID", "req-usage-json")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.begins) != 1 || recorder.begins[0].RequestID != "req-usage-json" {
+		t.Fatalf("usage begins = %+v", recorder.begins)
+	}
+	if len(recorder.finalizations) != 1 {
+		t.Fatalf("usage finalizations = %d, want 1", len(recorder.finalizations))
+	}
+	finalization := recorder.finalizations[0]
+	if finalization.TerminalStatus != usage.StatusSucceeded || finalization.Usage != (usage.TokenUsage{InputTokens: 12, OutputTokens: 8, CacheReadTokens: 3}) {
+		t.Fatalf("usage finalization = %+v", finalization)
+	}
+	if finalization.ResolvedModelID == nil || *finalization.ResolvedModelID != uuid.MustParse("33333333-3333-7333-8333-333333333333") || finalization.CredentialID == nil {
+		t.Fatalf("resolved route in usage = %+v", finalization)
+	}
+	if len(schedulerService.calls) != 1 || schedulerService.calls[0].RequestRecordID == nil || *schedulerService.calls[0].RequestRecordID != recorder.handle.RecordID {
+		t.Fatalf("scheduler request record id = %+v", schedulerService.calls)
+	}
+}
+func TestHandlerMarksPartialUsageForReconciliation(t *testing.T) {
+	handler, _, _, _, _, engine, _, _, _ := newProxyFixture(t)
+	recorder := &fakeProxyUsage{}
+	handler.usage = recorder
+	engine.result = inference.ExecutionResult{
+		StatusCode: http.StatusOK,
+		Body:       []byte(`{"id":"chatcmpl-partial","usage":{"completion_tokens":8}}`),
+	}
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"model":"bablo-chat"}`))
+	request.Header.Set("X-Request-ID", "req-partial-usage")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.finalizations) != 1 {
+		t.Fatalf("finalizations = %d, want 1", len(recorder.finalizations))
+	}
+	finalization := recorder.finalizations[0]
+	if finalization.TerminalStatus != usage.StatusReconcileNeeded || finalization.Provenance != usage.ProvenanceMissingUsage || finalization.Usage != (usage.TokenUsage{}) {
+		t.Fatalf("partial usage finalization = %+v", finalization)
+	}
+}
+func TestHandlerBindsResolvedPriceSnapshotToUsage(t *testing.T) {
+	handler, _, _, _, schedulerService, engine, _, _, _ := newProxyFixture(t)
+	recorder := &fakeProxyUsage{}
+	handler.usage = recorder
+	priceID := uuid.MustParse("aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaab")
+	prices := &fakeProxyPrices{snapshot: pricing.Snapshot{
+		VersionID: priceID,
+		Scope:     pricing.ScopeProviderModel,
+		Currency:  "USD",
+		Prices:    map[string]string{pricing.DimensionInputToken: "1"},
+	}}
+	handler.prices = prices
+	engine.result = inference.ExecutionResult{
+		StatusCode: http.StatusOK,
+		Body:       []byte(`{"id":"chatcmpl-price","usage":{"prompt_tokens":2,"completion_tokens":1}}`),
+	}
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"model":"bablo-chat"}`))
+	request.Header.Set("X-Request-ID", "req-price-snapshot")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	prices.mu.Lock()
+	if len(prices.modelIDs) != 1 || prices.modelIDs[0] != uuid.MustParse("33333333-3333-7333-8333-333333333333") {
+		t.Fatalf("price model calls = %#v", prices.modelIDs)
+	}
+	if len(prices.targetIDs) != 1 || prices.targetIDs[0] == nil || *prices.targetIDs[0] != schedulerService.selection.Target.ProviderModelID {
+		t.Fatalf("price target calls = %#v", prices.targetIDs)
+	}
+	prices.mu.Unlock()
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.finalizations) != 1 {
+		t.Fatalf("finalizations = %d, want 1", len(recorder.finalizations))
+	}
+	finalization := recorder.finalizations[0]
+	if finalization.PriceVersionID == nil || *finalization.PriceVersionID != priceID || finalization.Currency != "USD" {
+		t.Fatalf("price snapshot in usage = %+v", finalization)
+	}
+}
+
+func TestHandlerRecordsStreamUsageAndTTFT(t *testing.T) {
+	handler, _, _, _, _, engine, _, _, _ := newProxyFixture(t)
+	recorder := &fakeProxyUsage{}
+	handler.usage = recorder
+	engine.stream = &fakeProxyStream{steps: []proxyStreamStep{
+		{event: inference.StreamEvent{Payload: []byte(`data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}
+
+`)}},
+		{event: inference.StreamEvent{Payload: []byte(`data: [DONE]
+
+`), Done: true}},
+	}}
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"model":"bablo-chat","stream":true}`))
+	request.Header.Set("X-Request-ID", "req-usage-stream")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "[DONE]") {
+		t.Fatalf("stream response = %d %q", response.Code, response.Body.String())
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.finalizations) != 1 {
+		t.Fatalf("usage finalizations = %d, want 1", len(recorder.finalizations))
+	}
+	finalization := recorder.finalizations[0]
+	if finalization.TerminalStatus != usage.StatusSucceeded || finalization.Usage.InputTokens != 5 || finalization.Usage.OutputTokens != 2 || finalization.TTFT == nil {
+		t.Fatalf("stream usage finalization = %+v", finalization)
+	}
+}
+
+func TestHandlerFinalizesCancelledStreamWithoutUsage(t *testing.T) {
+	handler, _, _, _, _, engine, _, _, _ := newProxyFixture(t)
+	recorder := &fakeProxyUsage{}
+	handler.usage = recorder
+	engine.stream = &fakeProxyStream{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"model":"bablo-chat","stream":true}`)).WithContext(ctx)
+	request.Header.Set("X-Request-ID", "req-usage-cancel")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.finalizations) != 1 || recorder.finalizations[0].TerminalStatus != usage.StatusCancelled || recorder.finalizations[0].Provenance != usage.ProvenanceMissingUsage {
+		t.Fatalf("cancelled usage finalization = %+v", recorder.finalizations)
 	}
 }
 
@@ -782,6 +1011,18 @@ func TestNewHandlerRequiresAuthorizerAndInvokesIdentityMiddleware(t *testing.T) 
 	}
 	if _, err := NewHandler(Options{APIKeys: keys}); err == nil {
 		t.Fatal("NewHandler() accepted missing model catalog")
+	}
+	if _, err := NewHandler(Options{APIKeys: keys, Models: catalog, Engine: &fakeProxyEngine{}}); err == nil {
+		t.Fatal("NewHandler() accepted inference engine without usage recorder")
+	}
+	if _, err := NewHandler(Options{APIKeys: keys, Models: catalog, Engine: &fakeProxyEngine{}, UsageRecorder: &fakeProxyUsage{}}); err == nil {
+		t.Fatal("NewHandler() accepted inference engine without price resolver")
+	}
+	if _, err := NewHandler(Options{
+		APIKeys: keys, Models: catalog, Engine: &fakeProxyEngine{},
+		UsageRecorder: &fakeProxyUsage{}, PriceResolver: &fakeProxyPrices{},
+	}); err != nil {
+		t.Fatalf("NewHandler() rejected complete inference accounting dependencies: %v", err)
 	}
 }
 

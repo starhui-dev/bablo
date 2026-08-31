@@ -33,7 +33,7 @@ func TestMigrationsUpgradeAndRepeatSafely(t *testing.T) {
 	if _, err := provider.Up(ctx); err != nil {
 		t.Fatalf("upgrade to latest: %v", err)
 	}
-	if version, err := provider.GetDBVersion(ctx); err != nil || version != 9 {
+	if version, err := provider.GetDBVersion(ctx); err != nil || version != 10 {
 		t.Fatalf("version after upgrade = %d, %v", version, err)
 	}
 	results, err := provider.Up(ctx)
@@ -53,20 +53,74 @@ func TestLatestMigrationDownAndUp(t *testing.T) {
 	if err := Migrate(ctx, url, migrations.Files, logger); err != nil {
 		t.Fatalf("Migrate() error = %v", err)
 	}
-	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 9 {
+	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 10 {
 		t.Fatalf("version before rollback = %d, %v", version, err)
 	}
 	if err := MigrateDown(ctx, url, migrations.Files, logger); err != nil {
 		t.Fatalf("MigrateDown() error = %v", err)
 	}
-	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 8 {
+	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 9 {
 		t.Fatalf("version after rollback = %d, %v", version, err)
 	}
 	if err := Migrate(ctx, url, migrations.Files, logger); err != nil {
 		t.Fatalf("Migrate() after rollback error = %v", err)
 	}
-	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 9 {
+	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 10 {
 		t.Fatalf("version after restore = %d, %v", version, err)
+	}
+}
+func TestUsageMigrationBackfillsTimeSnapshot(t *testing.T) {
+	url := testDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	provider, err := newMigrationProvider(url, migrations.Files, logger)
+	if err != nil {
+		t.Fatalf("newMigrationProvider() error = %v", err)
+	}
+	defer func() { _ = provider.Close() }()
+	if _, err := provider.UpTo(ctx, 9); err != nil {
+		t.Fatalf("upgrade to v9: %v", err)
+	}
+	store, err := Open(ctx, Config{URL: url, MaxConns: 2})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	recordID := newTestUUID(t)
+	usageID := newTestUUID(t)
+	startedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Microsecond)
+	finishedAt := startedAt.Add(90 * time.Minute)
+	if err := store.WithTx(ctx, func(q Querier) error {
+		if _, err := q.Exec(ctx, `
+            INSERT INTO request_records (id, request_id, endpoint, requested_model, started_at, finished_at, terminal_status)
+            VALUES ($1, $2, '/v1/chat/completions', 'migration-model', $3, $4, 'succeeded')`,
+			recordID, "migration-request-"+recordID.String(), startedAt, finishedAt); err != nil {
+			return err
+		}
+		_, err := q.Exec(ctx, `
+            INSERT INTO usage_events (id, settlement_key, request_record_id, request_id, requested_model, terminal_status)
+            VALUES ($1, $2, $3, $4, 'migration-model', 'succeeded')`,
+			usageID, "migration-settlement-"+usageID.String(), recordID, "migration-request-"+recordID.String())
+		return err
+	}); err != nil {
+		store.Close()
+		t.Fatalf("seed v9 Usage facts: %v", err)
+	}
+	store.Close()
+	if _, err := provider.UpTo(ctx, 10); err != nil {
+		t.Fatalf("upgrade to v10: %v", err)
+	}
+	store, err = Open(ctx, Config{URL: url, MaxConns: 2})
+	if err != nil {
+		t.Fatalf("reopen after v10: %v", err)
+	}
+	defer store.Close()
+	var gotStartedAt, gotFinishedAt time.Time
+	if err := store.Queryer().QueryRow(ctx, `SELECT started_at, finished_at FROM usage_events WHERE id = $1`, usageID).Scan(&gotStartedAt, &gotFinishedAt); err != nil {
+		t.Fatalf("read backfilled Usage timestamps: %v", err)
+	}
+	if !gotStartedAt.Equal(startedAt) || !gotFinishedAt.Equal(finishedAt) {
+		t.Fatalf("backfilled timestamps = %v/%v, want %v/%v", gotStartedAt, gotFinishedAt, startedAt, finishedAt)
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/starhui-dev/bablo/internal/proxy"
 	"github.com/starhui-dev/bablo/internal/scheduler"
 	"github.com/starhui-dev/bablo/internal/secret"
+	"github.com/starhui-dev/bablo/internal/usage"
 )
 
 var buildVersion = "dev"
@@ -191,6 +192,17 @@ func run(arguments []string) int {
 				logger.Error("bablo_scheduler_service_error", "error", schedulerErr)
 				return 1
 			}
+			usageRepository, usageErr := usage.NewRepository(store)
+			if usageErr != nil {
+				logger.Error("bablo_usage_repository_error", "error", usageErr)
+				return 1
+			}
+			usageService, usageErr := usage.NewService(usageRepository)
+			if usageErr != nil {
+				logger.Error("bablo_usage_service_error", "error", usageErr)
+				return 1
+			}
+
 			cpaAdapter, err = cpa.NewService(cpa.ServiceOptions{ConfigPath: cfg.CPAConfigPath})
 			if err != nil {
 				logger.Error("bablo_cpa_adapter_error", "error", err)
@@ -226,6 +238,8 @@ func run(arguments []string) int {
 				Engine:          cpaAdapter,
 				HealthReporter:  catalog.credentialService,
 				RuntimeReporter: cpaAdapter,
+				UsageRecorder:   usageService,
+				PriceResolver:   catalog.pricingService,
 				Logger:          logger,
 			})
 			if handlerErr != nil {

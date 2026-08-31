@@ -15,8 +15,10 @@ import (
 	"github.com/starhui-dev/bablo/internal/credential"
 	"github.com/starhui-dev/bablo/internal/inference"
 	catalogmodel "github.com/starhui-dev/bablo/internal/model"
+	"github.com/starhui-dev/bablo/internal/pricing"
 	"github.com/starhui-dev/bablo/internal/route"
 	"github.com/starhui-dev/bablo/internal/scheduler"
+	"github.com/starhui-dev/bablo/internal/usage"
 )
 
 const (
@@ -68,6 +70,18 @@ type RuntimeReporter interface {
 	MarkCredentialResult(context.Context, inference.CredentialResult)
 }
 
+// UsageRecorder persists request and usage facts. It is optional during bootstrap
+// but should be configured for every production inference handler.
+type UsageRecorder interface {
+	usage.Recorder
+}
+
+// PriceSnapshotResolver binds the exact active price version to a resolved
+// provider model before an upstream request is executed.
+type PriceSnapshotResolver interface {
+	ResolveSnapshot(context.Context, uuid.UUID, *uuid.UUID, time.Time) (pricing.Snapshot, error)
+}
+
 var (
 	_ KeyAuthorizer         = (*apikey.Service)(nil)
 	_ AuthorizedModelLister = (*apikey.Service)(nil)
@@ -86,6 +100,8 @@ type Options struct {
 	Engine          inference.Engine
 	HealthReporter  HealthReporter
 	RuntimeReporter RuntimeReporter
+	UsageRecorder   UsageRecorder
+	PriceResolver   PriceSnapshotResolver
 	Logger          *slog.Logger
 	MaxBodyBytes    int64
 	LeaseTTL        time.Duration
@@ -101,6 +117,8 @@ type Handler struct {
 	engine       inference.Engine
 	health       HealthReporter
 	runtime      RuntimeReporter
+	usage        UsageRecorder
+	prices       PriceSnapshotResolver
 	logger       *slog.Logger
 	maxBodyBytes int64
 	leaseTTL     time.Duration
@@ -118,6 +136,12 @@ func NewHandler(options Options) (http.Handler, error) {
 	}
 	if options.Models == nil {
 		return nil, errors.New("proxy handler requires model catalog")
+	}
+	if options.Engine != nil && options.UsageRecorder == nil {
+		return nil, errors.New("proxy handler requires usage recorder when inference engine is configured")
+	}
+	if options.Engine != nil && options.PriceResolver == nil {
+		return nil, errors.New("proxy handler requires price resolver when inference engine is configured")
 	}
 	if options.Logger == nil {
 		options.Logger = slog.Default()
@@ -148,6 +172,8 @@ func NewHandler(options Options) (http.Handler, error) {
 		engine:       options.Engine,
 		health:       options.HealthReporter,
 		runtime:      options.RuntimeReporter,
+		usage:        options.UsageRecorder,
+		prices:       options.PriceResolver,
 		logger:       options.Logger,
 		maxBodyBytes: options.MaxBodyBytes,
 		leaseTTL:     options.LeaseTTL,
