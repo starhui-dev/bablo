@@ -14,17 +14,20 @@ import (
 
 // Server is the Bablo HTTP server. Domain handlers are added in later stages.
 type Server struct {
-	config              config.Config
-	logger              *slog.Logger
-	version             string
-	httpServer          *http.Server
-	requestCount        atomic.Uint64
-	readiness           *Readiness
-	authHandler         http.Handler
-	apiKeyHandler       http.Handler
-	modelHandler        http.Handler
-	adminCatalogHandler http.Handler
-	inferenceHandler    http.Handler
+	config                config.Config
+	logger                *slog.Logger
+	version               string
+	httpServer            *http.Server
+	requestCount          atomic.Uint64
+	readiness             *Readiness
+	authHandler           http.Handler
+	apiKeyHandler         http.Handler
+	modelHandler          http.Handler
+	adminCatalogHandler   http.Handler
+	inferenceHandler      http.Handler
+	paymentUserHandler    http.Handler
+	paymentAdminHandler   http.Handler
+	paymentWebhookHandler http.Handler
 }
 
 // Option configures optional domain HTTP surfaces.
@@ -63,6 +66,21 @@ func WithAdminCatalogHandler(handler http.Handler) Option {
 	return func(server *Server) {
 		server.adminCatalogHandler = handler
 	}
+}
+
+// WithPaymentUserHandler mounts authenticated payment order and voucher routes.
+func WithPaymentUserHandler(handler http.Handler) Option {
+	return func(server *Server) { server.paymentUserHandler = handler }
+}
+
+// WithPaymentAdminHandler mounts administrator-only wallet and payment operations.
+func WithPaymentAdminHandler(handler http.Handler) Option {
+	return func(server *Server) { server.paymentAdminHandler = handler }
+}
+
+// WithPaymentWebhookHandler mounts provider-authenticated payment callbacks.
+func WithPaymentWebhookHandler(handler http.Handler) Option {
+	return func(server *Server) { server.paymentWebhookHandler = handler }
 }
 
 // New constructs the bootstrap server without opening a listener.
@@ -160,6 +178,20 @@ func (s *Server) routes() http.Handler {
 		mux.Handle("/api/v1/admin/credential-pools", s.adminCatalogHandler)
 		mux.Handle("/api/v1/admin/credential-pools/", s.adminCatalogHandler)
 		mux.Handle("/api/v1/admin/prices/", s.adminCatalogHandler)
+	}
+	if s.paymentUserHandler != nil {
+		mux.Handle("/api/v1/me/payment-orders", s.paymentUserHandler)
+		mux.Handle("/api/v1/me/payment-orders/", s.paymentUserHandler)
+		mux.Handle("/api/v1/me/payment-vouchers/redeem", s.paymentUserHandler)
+	}
+	if s.paymentAdminHandler != nil {
+		mux.Handle("/api/v1/admin/wallet-credits", s.paymentAdminHandler)
+		mux.Handle("/api/v1/admin/payment-orders/", s.paymentAdminHandler)
+		mux.Handle("/api/v1/admin/payment-vouchers", s.paymentAdminHandler)
+		mux.Handle("/api/v1/admin/payment-vouchers/", s.paymentAdminHandler)
+	}
+	if s.paymentWebhookHandler != nil {
+		mux.Handle("/webhooks/", s.paymentWebhookHandler)
 	}
 	if s.inferenceHandler != nil {
 		mux.Handle("/v1/models", s.inferenceHandler)

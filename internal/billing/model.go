@@ -29,16 +29,20 @@ const (
 )
 
 const (
-	EntryReservation     = "reservation"
-	EntryUsageCharge     = "usage_charge"
-	EntryRelease         = "release"
-	EntryRecharge        = "recharge"
-	EntryRefund          = "refund"
-	EntryAdjustment      = "adjustment"
-	EntryAdminAdjustment = "admin_adjustment"
-	EntryGrant           = "grant"
-	EntryBonus           = "bonus"
-	EntryExpiration      = "expiration"
+	EntryReservation          = "reservation"
+	EntryUsageCharge          = "usage_charge"
+	EntryRelease              = "release"
+	EntryRecharge             = "recharge"
+	EntryRefund               = "refund"
+	EntryAdjustment           = "adjustment"
+	EntryAdminAdjustment      = "admin_adjustment"
+	EntryGrant                = "grant"
+	EntryBonus                = "bonus"
+	EntryExpiration           = "expiration"
+	EntryPaymentRefundHold    = "payment_refund_hold"
+	EntryPaymentReversal      = "payment_reversal"
+	EntryPaymentRefundRelease = "payment_refund_release"
+	EntryPaymentLiability     = "payment_liability"
 )
 
 var (
@@ -64,9 +68,33 @@ type Wallet struct {
 	AvailableBalanceMinor int64     `json:"available_balance_minor"`
 	ReservedBalanceMinor  int64     `json:"reserved_balance_minor"`
 	Status                string    `json:"status"`
+	FinancialHold         bool      `json:"financial_hold"`
 	Version               int64     `json:"version"`
 	CreatedAt             time.Time `json:"created_at"`
 	UpdatedAt             time.Time `json:"updated_at"`
+}
+type LiabilityInput struct {
+	UserID        uuid.UUID
+	Currency      string
+	LiabilityType string
+	ReferenceType string
+	ReferenceID   string
+	AmountMinor   int64
+}
+
+type Liability struct {
+	ID                   uuid.UUID
+	WalletID             uuid.UUID
+	LiabilityType        string
+	ReferenceType        string
+	ReferenceID          string
+	PrincipalAmountMinor int64
+	RecoveredAmountMinor int64
+	Currency             string
+	Status               string
+	RecoveryLedgerID     *uuid.UUID
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 // LedgerEntry is append-only. Delta fields are the authoritative movements;
@@ -167,7 +195,19 @@ type CreditInput struct {
 	ReferenceType  string
 	ReferenceID    string
 	IdempotencyKey string
+	RequestID      string
 	OperatorUserID *uuid.UUID
+	Source         string
+}
+
+// PaymentRefundInput identifies one externally refunded payment order. The
+// operator is retained on every hold/reversal/release ledger fact.
+type PaymentRefundInput struct {
+	UserID         uuid.UUID
+	Currency       string
+	AmountMinor    int64
+	PaymentOrderID uuid.UUID
+	OperatorUserID uuid.UUID
 	Source         string
 }
 
@@ -207,7 +247,8 @@ func validSettlementStatus(value string) bool {
 func validEntryType(value string) bool {
 	switch value {
 	case EntryReservation, EntryUsageCharge, EntryRelease, EntryRecharge, EntryRefund,
-		EntryAdjustment, EntryAdminAdjustment, EntryGrant, EntryBonus, EntryExpiration:
+		EntryAdjustment, EntryAdminAdjustment, EntryGrant, EntryBonus, EntryExpiration,
+		EntryPaymentRefundHold, EntryPaymentReversal, EntryPaymentRefundRelease, EntryPaymentLiability:
 		return true
 	default:
 		return false

@@ -158,3 +158,39 @@ sdk/translator.Format* / FromString
 ```
 
 验证命令及结果：`go test -p 1 -race ./... -count=1`（本机 PostgreSQL/Redis 测试实例）通过；`go test -race ./internal/proxy -count=1`、`go vet ./...`、`go build -trimpath -o /tmp/bablo-proxy-verify ./cmd/bablo`、迁移二进制构建和前端 lint/typecheck/test/build 通过。Credential 集成覆盖 PostgreSQL secret lifecycle、key rotation、复合游标、health 和 runtime source；Proxy fake provider/engine 覆盖模型列表、Chat/Responses、JSON/SSE、取消、错误和租约/health 反馈。并行共享数据库测试曾因迁移锁/连接竞争超时，生产兼容性门禁仍需独立数据库与真实上游凭据。
+
+## 8. Stripe Payment Adapter Compatibility
+
+> 核验日期：2026-09-01。范围仅为锁定 `stripe-go/v86 v86.2.0` 的本地 adapter 与源码/contract tests；真实 Stripe test-mode/live 网络尚未验证。
+
+| 项目 | 已核验事实 | 来源 |
+|---|---|---|
+| 官方 SDK | `github.com/stripe/stripe-go/v86` | <https://github.com/stripe/stripe-go>；<https://pkg.go.dev/github.com/stripe/stripe-go/v86> |
+| 精确版本 | `v86.2.0`，发布于 2026-07-29；annotated tag 指向 commit `cb52f09a01f50f390776c5adc850e9d5ce4d1d9c` | <https://github.com/stripe/stripe-go/releases/tag/v86.2.0>；<https://api.github.com/repos/stripe/stripe-go/git/tags/797dd626b67d78f5e689d2e1824f227744ac09a5> |
+| SDK API version | `2026-07-29.dahlia` | <https://github.com/stripe/stripe-go/blob/v86.2.0/api_version.go> |
+| Checkout | per-client `client.New(secret, nil)`；`V1CheckoutSessions.Create/Retrieve`；server-side Payment mode | <https://github.com/stripe/stripe-go/blob/v86.2.0/checkout_session/client.go>；<https://docs.stripe.com/payments/checkout/how-checkout-works> |
+| Refund / recovery | `V1Refunds.Create/Retrieve`；`V1PaymentIntents.Retrieve` 与 `V1Charges.Retrieve` 只用于从已验签 external refund/dispute 恢复 Bablo order metadata；最终财务状态只接受 webhook/Provider API authenticated fact | <https://github.com/stripe/stripe-go/blob/v86.2.0/refund/client.go>；<https://github.com/stripe/stripe-go/blob/v86.2.0/paymentintent/client.go>；<https://github.com/stripe/stripe-go/blob/v86.2.0/charge/client.go> |
+| Webhook | `webhook.ConstructEventWithOptions` 验证原始 body、timestamp、signature 并按默认选项拒绝 API version mismatch；adapter 另核对 event/object live mode 与 Connect account | <https://github.com/stripe/stripe-go/blob/v86.2.0/webhooks.go>；<https://docs.stripe.com/webhooks/signature> |
+
+当前实际使用的公开符号：
+
+```text
+stripe.Client / stripe.NewClient
+stripe.CheckoutSessionCreateParams / CheckoutSessionRetrieveParams / CheckoutSessionExpireParams / CheckoutSession
+stripe.RefundCreateParams / RefundRetrieveParams / Refund
+stripe.PaymentIntentRetrieveParams / PaymentIntent
+stripe.ChargeRetrieveParams / Charge / Dispute
+stripe.Event / EventData / EventType*
+stripe.String / Int64 / Bool
+client.API.V1CheckoutSessions.Create / Retrieve / Expire
+client.API.V1Refunds.Create / Retrieve
+client.API.V1PaymentIntents.Retrieve
+client.API.V1Charges.Retrieve
+webhook.ConstructEventWithOptions / GenerateTestSignedPayload
+```
+
+集成边界：Stripe 类型只存在于 `internal/payment/stripe.go` 与 adapter contract tests；`payment.Service`、repository、HTTP DTO 和 PostgreSQL schema 仅使用 Bablo `Provider`/`VerifiedEvent` 领域类型。SDK 以 `go.mod` 直接依赖精确锁定，不使用全局 `stripe.Key`。
+
+已验证：本地 fake Stripe API 覆盖 Checkout Create/Retrieve/Expire、refund Create/Retrieve、PaymentIntent/Charge metadata lookup、Connect account 绑定和 stable idempotency key；SDK signed webhook 覆盖付款成功/异步失败/过期、refund pending/succeeded/failed、external refund、dispute open/won/lost、签名错误、过期签名、API version mismatch、live-mode/account mismatch 和 tampered payload；PostgreSQL 集成覆盖重复/并发事件、冲突 order/trade/object ID、金额/币种/merchant/mode mismatch、无效签名零持久化、rejected replay、wallet refund hold/consume/release、external liability、dispute reversal 与账本重建。
+
+上线阻塞：尚无真实 Stripe test-mode secret、webhook signing secret、Connect account 和外部可达 HTTPS endpoint，因此未执行 `Checkout create -> customer payment -> signed webhook -> wallet credit -> Bablo refund / external refund / dispute -> liability recovery` 端到端。部署时必须创建与 `2026-07-29.dahlia` 兼容的 webhook endpoint；若 Dashboard endpoint 使用不兼容 release train，当前实现 fail closed。完成真实 test-mode E2E 前，Stripe self-service payment 为 NO-GO。

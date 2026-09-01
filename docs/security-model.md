@@ -2,7 +2,7 @@
 
 > 目标：生产级多用户 AI Gateway 的控制面、推理面和账务安全基线
 > 日期：2026-08-31
-> 当前状态：P0 Web Session、CSRF、RBAC、管理员 TOTP/恢复码、推理 API Key、上游 Credential AEAD/轮换、Route/Scheduler/Proxy、不可变 Usage 与 Wallet Billing 已实现；真实上游、支付和最终生产安全门禁仍未放行。
+> 当前状态：P0 Web Session、CSRF、RBAC、管理员 TOTP/恢复码、Redis 登录/MFA 限流、推理 API Key、上游 Credential AEAD/轮换、Route/Scheduler/Proxy、不可变 Usage/Wallet Billing 与支付内核已实现；真实上游、Stripe 商户 E2E、备份恢复和最终生产安全门禁仍未放行。
 
 ## 1. 资产与信任边界
 
@@ -26,7 +26,7 @@
 - 密码使用 Argon2id PHC 格式；当前参数版本 `argon2id-v1-m19456-t2-p1` 对应 19 MiB、2 iterations、1 lane、16-byte salt、32-byte key。`users.password_params_version` 记录策略版本，成功登录时按当前参数自动 rehash；密码长度为 12–1024 UTF-8 bytes；
 - Session token 与 CSRF token 各由 CSPRNG 生成 32 bytes。浏览器只收到一次明文；PostgreSQL 只存 SHA-256 hash。Session 默认 TTL 12h，可配置范围 5m–7d；登录、MFA 成功均旋转 Session，密码变更/重置和 logout-all 撤销全部 Session；
 - `bablo_session` Cookie 为 `HttpOnly`、`SameSite=Lax`、Path `/api/v1`，生产环境强制 `Secure`；`bablo_csrf` 为前端可读、Path `/`、同样有限 TTL。所有状态变更同时校验显式 `Origin`、CSRF Cookie、`X-CSRF-Token` 和 Session 内绑定 hash，SameSite 不是唯一防线；
-- 登录和 MFA 使用有界单实例 fixed-window limiter：默认每个 email + source IP 5 分钟 8 次，窗口到期自动恢复，不写永久账号锁。P0 单实例可用；HA 前必须替换/补充 Redis 协调实现，仍不得把 Redis 当身份事实源；
+- 登录和 MFA 分别执行 account + source-address 双 fixed-window 门禁：默认每账号 5 分钟 8 次、每地址 40 次；MFA recovery code 走同一门禁。生产环境强制配置 Redis，Lua 在一个原子操作中递增两个窗口且 Redis 错误 fail closed；非生产无 Redis 时才使用有界进程内实现。反向代理地址只在直连 peer 命中 `BABLO_TRUSTED_PROXY_CIDRS` 时解析 `X-Forwarded-For`，并从右向左剥离可信代理；客户端直连伪造 forwarded header 不生效；
 - RBAC 至少 `admin`/`user`。授权在 auth service 内重新判断，不依赖 UI。生产 `BABLO_AUTH_REQUIRE_ADMIN_MFA` 不能关闭；管理员操作要求 admin role 且当前 Session 已完成 MFA。未绑定 MFA 的管理员只允许登录和进入绑定流程，不能执行管理员密码重置；
 - TOTP 使用 30 秒、6 digits、HMAC-SHA1 兼容配置，允许 ±1 period，`last_totp_counter` 在行锁事务内前进以拒绝重放。绑定先写 pending factor，再用有效 TOTP 二次确认；成功后原子生成并 hash 存储 10 个 80-bit 恢复码、旋转 Session；恢复码通过条件 UPDATE 单次消费；
 - TOTP secret 使用 AES-256-GCM，主密钥由 `BABLO_AUTH_ENCRYPTION_KEY` 以 32-byte base64 注入，ciphertext/nonce/key_version 写 PostgreSQL，AEAD AAD 绑定 factor ID、user ID 和 key version。当前只读取活动 key version；多版本解密和后台 re-encrypt 属于 credentials/security 阶段上线阻塞；
@@ -73,9 +73,13 @@
 - `wallet_ledger.available_delta_minor` / `reserved_delta_minor` 是余额重建权威，balance-after snapshot 用于审计。数据库 trigger 以 SQLSTATE `55000` 拒绝 UPDATE/DELETE；
 - settle 少于预留只追加 release，多于预留从 available 补扣；补扣不足保留 reservation，写 pending settlement 与 outbox。missing usage 按 reservation 标记 estimated/reconcile 后结算，不能释放成免费请求；
 - recharge/refund/grant/bonus/adjustment/admin_adjustment/expiration 均追加 ledger。管理员调账要求 operator，并在同一事务写 sanitized audit；不修改历史 entry；
-- 支付 webhook 必须按 provider 当前官方规范验签，并验证 merchant/app ID、订单号、金额、币种、状态和时间窗；provider event/trade ID 唯一；
-- webhook 事务只更新订单、写 event、充值 ledger 和 outbox；客户端成功页不入账；
-- 没有真实 sandbox/商户凭据时，支付只能是 disabled、fixture 或 runbook 状态，对外标记 NO-GO。
+- 支付 webhook 必须按 Provider 当前官方规范验证原始 body；Stripe 使用锁定 `stripe-go/v86 v86.2.0` 的 `Stripe-Signature` HMAC/timestamp 校验，并要求 webhook event API release train 与 SDK `2026-07-29.dahlia` 兼容；同时校验 Connect account/merchant 与 event/object live mode；
+- 无效签名、未知 API version、过大 body 或并发过载不写数据库。验签后的 event 才可写 immutable PaymentEvent；`(payment_provider, provider_event_id)` 唯一，同 event ID 的 payload hash、event type、金额/币种、merchant/live mode 和 Provider object IDs 必须完全一致；
+- 已认证 event 要求 Bablo order、Checkout Session/trade、Refund、PaymentIntent、Charge 等所有本地已有标识同时一致，不能用其中一个匹配掩盖另一个冲突。签名有效但订单错配/非法状态保存 rejected processing/audit 事实，暂态数据库错误回滚并返回 5xx 供 Provider 重试；
+- webhook 事务只更新订单、写 PaymentEvent、Wallet Ledger、liability、audit/outbox；客户端 success/cancel URL 不入账。Bablo 发起退款先把 available 转为 reserved，验签成功才消费，确定失败才释放，网络不确定结果保持 pending；Provider 控制台外部退款和 charge dispute 通过 `wallet_liabilities` 回收余额，不足部分设置 `financial_hold` 并阻止新消费。后续充值按 FIFO 回收 liability，settlement worker 以租约重试 pending settlement；争议胜诉追加反向 ledger；
+- Provider create/refund 调用使用稳定 idempotency key、持久 operation lease，并固定 payload hash、merchant 与 live/test mode；进程崩溃或并发 worker 不得重复调用或切换商户；
+- Stripe secret key、webhook signing secret、voucher AEAD key 只从环境/secret store 注入，不写日志/数据库普通字段/checkout_data；生产拒绝 test key、HTTP return URL、fixture，任何启用支付能力都要求 PostgreSQL；
+- 没有真实 Stripe test-mode/sandbox 与商户凭据的 create/payment/refund/external-refund/dispute E2E 证据时，Stripe self-service payment 仍为 NO-GO；fixture 只允许显式 opt-in 的非生产本地/集成测试。
 
 ## 6. 日志、隐私与数据最小化
 

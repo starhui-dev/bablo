@@ -30,10 +30,10 @@ Bablo InferenceEngine adapter]
 
 ### P0 单实例
 
-- `bablo`：HTTP server、CPA service、scheduler、usage settlement、wallet reservation/settlement、outbox/quota worker；
+- `bablo`：HTTP server、CPA service、scheduler、usage settlement、wallet reservation/settlement、payment operation/reconciliation、outbox/quota worker；
 - PostgreSQL：唯一业务数据库；只允许私网/容器网络访问；
-- Redis：API Key RPM/TPM 固定分钟窗口计数、credential concurrency lease、短 TTL affinity/cursor；全部状态可重建，配置 Redis 后错误 fail closed；未配置时只允许 P0 单实例使用进程内计数；daily/monthly budget 与钱包余额只由 PostgreSQL Billing 事实判定；
-- 反向代理/TLS：部署环境提供，域名不写死；
+- Redis：生产必需的登录/MFA 双维 fixed-window、API Key RPM/TPM、credential concurrency lease、短 TTL affinity/cursor；全部状态可重建，错误 fail closed。非生产无 Redis 时才允许有界进程内 fallback；daily/monthly budget、身份权限和钱包余额只由 PostgreSQL 事实判定；
+- 反向代理/TLS：部署环境提供，域名不写死；只有直连 peer 命中显式 trusted CIDR 时，Web 登录/MFA 才接受其 `X-Forwarded-For` 链；
 - CPA management endpoint：不暴露公网，优先不启用远程管理。
 
 ### HA 演进
@@ -63,7 +63,7 @@ Bablo InferenceEngine adapter]
 | `usage` | request/attempt、immutable UsageEvent、reconcile/outbox | token/status/latency、settlement key | 依赖 CPA usage queue 作为最终账 |
 | `pricing` | price version、resolved target 价格 | 已发布 price snapshot | 用 float、重写历史价格、让 draft 入账 |
 | `wallet/billing` | exact quote、reservation、settlement、charge/release/refund/adjustment、budget | ledger entry、pending settlement、balance projection | UPDATE 历史 ledger、并发透支、只按 alias 计费 |
-| `payment` | order/event 状态机、webhook 验签边界 | provider event、idempotency key | 信任客户端支付成功 |
+| `payment` | Provider-neutral order/event/refund 状态机、voucher/admin credit、webhook 验签与 Stripe adapter | safe checkout redirect、verified provider event、ledger idempotency key | 信任客户端支付成功、持久化 Provider secret、在未验签前到账/退款 |
 | `stats` | 从 Usage/Ledger 的查询和 rollup | filters、aggregates | 自建另一套计费公式 |
 | `audit` | 管理员/敏感动作不可变记录 | actor/action/target/result | 记录 secret、Prompt/响应正文 |
 | `inference/cpa` | CPA SDK lifecycle、请求/流、错误和 capability 映射 | Bablo `InferenceEngine` 类型 | 向业务泄漏 CPA 类型或 import CPA `internal/*` |
@@ -75,7 +75,7 @@ Bablo InferenceEngine adapter]
 
 管理员目录写接口统一经 `auth.Handler.ProtectRole(..., "admin")`，再由 model/provider/pricing service 复核输入、事务和 audit；普通 Web Session 只能访问用户模型目录，不能绕过 RBAC 写资源。
 
-P0 登录/MFA limiter 是有容量上限和自动过期的进程内状态，符合单实例首发边界；HA 前必须迁移为 Redis 协调实现。PostgreSQL 仍是用户、角色、Session 撤销、MFA 和 audit 的唯一事实源，Redis 丢失不能恢复权限或 Session。
+登录与 MFA limiter 使用同一 `AttemptLimiter` 边界但独立 namespace：每账号与每 source address 同时计数，生产由 Redis Lua 原子执行并 fail closed；非生产单实例可使用有界内存实现。PostgreSQL 仍是用户、角色、Session 撤销、MFA 和 audit 的唯一事实源，Redis 丢失不能恢复权限或 Session。可信代理 CIDR 只决定是否接受直连代理提供的 forwarded chain，不允许客户端自报地址。
 
 ### API Key 调用边界
 
@@ -93,7 +93,13 @@ P0 登录/MFA limiter 是有容量上限和自动过期的进程内状态，符�
 
 `internal/proxy -> billing.Service -> billing.Repository -> internal/data.Store`。Proxy 先完成 entitlement、immutable route snapshot、Scheduler credential 选择和 resolved provider-model price snapshot，再调用 `Reserve`；非零 reservation 固定 request、wallet、route/provider/credential、price version 和预估 token。`Reserve` 先串行化 API Key budget，再锁 wallet 把 available 转入 reserved，失败时不调用 CPA。
 
-推理完成后 `internal/usage` 先提交 immutable UsageEvent/outbox，随后 Billing 使用该 Event 幂等 `Settle`。少于预留追加 release，多于预留从 available 补扣；补扣不足保留 reservation 并写 pending settlement/outbox。missing usage 按 reservation 金额标记 estimated/reconcile 后结算，不作为免费请求。ledger delta 是余额重建权威，数据库拒绝历史 UPDATE/DELETE；用户/管理员钱包 HTTP surface 后置到 `bablo-user` / `bablo-admin`。
+推理完成后 `internal/usage` 先提交 immutable UsageEvent/outbox，随后 Billing 使用该 Event 幂等 `Settle`。少于预留追加 release，多于预留从 available 补扣；补扣不足保留 reservation、设置 wallet financial hold 并写 pending settlement/outbox。后续 credit 在同一 wallet 事务内按 FIFO 回收 open liability；独立 settlement recovery worker 通过 owner lease 重试 pending settlement，任一欠费未清除前 financial hold 持续阻止新消费。missing usage 按 reservation 金额标记 estimated/reconcile 后结算，不作为免费请求。ledger delta 是余额重建权威，数据库拒绝历史 UPDATE/DELETE；用户/管理员钱包查询 HTTP surface 后置到 `bablo-user` / `bablo-admin`。
+
+### Payment 调用边界
+
+`internal/payment.Handler -> payment.Service -> payment.Repository -> internal/data.Store`。Service 只依赖 Bablo `payment.Provider` 接口；Stripe SDK 仅存在于 `internal/payment/stripe.go`，当前精确锁定 `stripe-go/v86 v86.2.0`。创建订单先持久化 Bablo order，再用 order number 派生稳定 Provider idempotency key；Provider operation 以 payload hash、merchant/live mode、owner token 和短租约持久化单飞与崩溃恢复；Checkout response 只保存/返回允许的 redirect URL 与非敏感 Session ID。
+
+`/webhooks/stripe` 在任何数据库写入前验证原始 body 的 `Stripe-Signature`、timestamp、API release train、Connect account/merchant 和 live mode。验签后进入订单行锁事务，要求所有本地已有的 order/trade/refund/payment-intent/charge 标识同时一致。付款成功追加 recharge ledger；Bablo 退款先 hold available，success 消费、definitive failure 释放、未知结果保持 pending；Provider 外部退款和 charge dispute 通过 wallet liability 回收余额并在不足时冻结新消费，争议胜诉追加反向 ledger。fixture 只用于显式 opt-in 的非生产测试；真实 Stripe test-mode E2E 未完成前 self-service payment 保持 NO-GO。
 
 ## 4. 稳定领域接口
 
@@ -154,7 +160,7 @@ type Stream interface {
 - **预算预留**：API-key advisory transaction lock 计算周期 charge + active/pending reservation，再锁 wallet 行；reservation/ledger/outbox 同事务提交，拒绝时不触发上游请求；
 - **Usage finalize**：immutable `usage_events` 与 Usage outbox 同事务提交；与 Billing settlement 分成可恢复的两个事务边界，崩溃窗口由 request/reservation/Usage 唯一键和 retry worker 收敛；
 - **结算**：reservation、wallet projection、usage charge/release ledger、`billing_settlements` 与 Billing outbox 同事务提交；不足进入 pending，不产生负余额或静默免费；
-- **支付**：webhook 验签、订单状态变更、payment event、recharge ledger/outbox 在一个 transaction 内完成，provider event ID 唯一；
+- **支付**：Provider API 调用与数据库事务分离；stable idempotency key 和 pending 状态收敛不确定结果。验签 webhook 在一个 transaction 内锁订单并提交订单状态、immutable payment event、wallet ledger、audit/outbox；Provider event ID 唯一。退款在外部调用前以单独事务 hold 余额，只有 verified terminal event 结算或释放；
 - **Scheduler lease**：Redis `SET NX PX` + owner token，finally/recovery 释放；Redis 故障时进入保守失败，而不是超卖并发；
 - **CPA 失败**：首包前允许有限、可记录的 fallback；首包后只上报错误并结算已知或 reserved estimated usage；不得重复真实执行请求；
 - **进程崩溃**：数据库事实可恢复；outbox/settlement worker 重新 claim；Redis 状态过期后重建。

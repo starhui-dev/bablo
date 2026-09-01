@@ -375,27 +375,121 @@ func TestSettlementPendingRetriesAfterFunding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetWallet() error: %v", err)
 	}
-	if wallet.AvailableBalanceMinor != 0 || wallet.ReservedBalanceMinor != 50 {
+	if wallet.AvailableBalanceMinor != 0 || wallet.ReservedBalanceMinor != 50 || !wallet.FinancialHold {
 		t.Fatalf("pending wallet = %+v", wallet)
 	}
 	if count := billingCount(t, store, `SELECT count(*) FROM wallet_ledger WHERE wallet_id = $1 AND entry_type = 'usage_charge'`, wallet.ID); count != 0 {
 		t.Fatalf("pending usage charge count = %d, want 0", count)
 	}
 	creditWallet(t, service, fixture, 60, "credit-retry")
-	settled, err := service.Settle(ctx, SettleInput{ReservationID: reservation.ID, Event: event})
-	if err != nil || settled.Status != SettlementSettled {
-		t.Fatalf("retried Settle() = %+v, error=%v", settled, err)
+	if _, err := service.Reserve(ctx, reserveInput(fixture, "billing-pending-blocked", priceSnapshot(fixture.price, "0", "0.01"), 0, 1)); !errors.Is(err, ErrWalletFrozen) {
+		t.Fatalf("Reserve() while settlement pending error = %v, want ErrWalletFrozen", err)
+	}
+	if _, err := store.Queryer().Exec(ctx, `
+		UPDATE billing_settlements SET next_attempt_at = now() - interval '1 second'
+		WHERE reservation_id = $1`, reservation.ID); err != nil {
+		t.Fatalf("advance pending settlement retry: %v", err)
+	}
+	recovered, err := service.RecoverPendingSettlements(ctx, 10)
+	if err != nil || recovered != 1 {
+		t.Fatalf("RecoverPendingSettlements() = (%d, %v)", recovered, err)
 	}
 	wallet, err = service.GetWallet(ctx, fixture.user, "USD")
 	if err != nil {
-		t.Fatalf("GetWallet() after retry error: %v", err)
+		t.Fatalf("GetWallet() after recovery error: %v", err)
 	}
-	if wallet.AvailableBalanceMinor != 10 || wallet.ReservedBalanceMinor != 0 {
-		t.Fatalf("settled wallet = %+v, want available=10 reserved=0", wallet)
+	if wallet.AvailableBalanceMinor != 10 || wallet.ReservedBalanceMinor != 0 || wallet.FinancialHold {
+		t.Fatalf("settled wallet = %+v, want available=10 reserved=0 hold=false", wallet)
 	}
 	available, reserved, err := service.RebuildBalance(ctx, wallet.ID)
 	if err != nil || available != 10 || reserved != 0 {
 		t.Fatalf("rebuilt pending wallet = %d/%d error=%v", available, reserved, err)
+	}
+}
+
+func TestSettlementRecoveryKeepsHoldWhileLiabilityOpen(t *testing.T) {
+	store := openBillingTestStore(t)
+	fixture := seedBillingFixture(t, store)
+	service := billingServiceForTest(t, store)
+	ctx := context.Background()
+	creditWallet(t, service, fixture, 50, "credit-combined-hold")
+	reservation, err := service.Reserve(ctx, reserveInput(fixture, "billing-combined-hold", priceSnapshot(fixture.price, "0", "0.50"), 0, 1))
+	if err != nil {
+		t.Fatalf("Reserve() error: %v", err)
+	}
+	event := insertBillingUsage(t, store, fixture, reservation, 100, false)
+	if _, err := service.Settle(ctx, SettleInput{ReservationID: reservation.ID, Event: event}); !errors.Is(err, ErrSettlementPending) {
+		t.Fatalf("pending Settle() error = %v", err)
+	}
+	creditWallet(t, service, fixture, 50, "fund-combined-settlement")
+	wallet, err := service.GetWallet(ctx, fixture.user, "USD")
+	if err != nil {
+		t.Fatalf("GetWallet() error: %v", err)
+	}
+	liabilityID := uuid.New()
+	if _, err := store.Queryer().Exec(ctx, `
+		INSERT INTO wallet_liabilities (
+			id, wallet_id, liability_type, reference_type, reference_id,
+			principal_amount_minor, recovered_amount_minor, currency, status
+		)
+		VALUES ($1, $2, 'payment_dispute', 'payment_dispute', $3, 10, 0, 'USD', 'open')`,
+		liabilityID, wallet.ID, "combined-hold-"+liabilityID.String()); err != nil {
+		t.Fatalf("seed open liability: %v", err)
+	}
+	if _, err := store.Queryer().Exec(ctx, `
+		UPDATE billing_settlements SET next_attempt_at = now() - interval '1 second'
+		WHERE reservation_id = $1`, reservation.ID); err != nil {
+		t.Fatalf("advance pending settlement retry: %v", err)
+	}
+	if recovered, err := service.RecoverPendingSettlements(ctx, 10); err != nil || recovered != 1 {
+		t.Fatalf("RecoverPendingSettlements() = (%d, %v)", recovered, err)
+	}
+	wallet, err = service.GetWallet(ctx, fixture.user, "USD")
+	if err != nil {
+		t.Fatalf("GetWallet() after settlement recovery error: %v", err)
+	}
+	if wallet.AvailableBalanceMinor != 0 || wallet.ReservedBalanceMinor != 0 || !wallet.FinancialHold {
+		t.Fatalf("wallet with open liability = %+v, want 0/0 and held", wallet)
+	}
+	if _, err := service.Reserve(ctx, reserveInput(fixture, "billing-combined-blocked", priceSnapshot(fixture.price, "0", "0.01"), 0, 1)); !errors.Is(err, ErrWalletFrozen) {
+		t.Fatalf("Reserve() with open liability error = %v, want ErrWalletFrozen", err)
+	}
+	creditWallet(t, service, fixture, 10, "recover-combined-liability")
+	wallet, err = service.GetWallet(ctx, fixture.user, "USD")
+	if err != nil {
+		t.Fatalf("GetWallet() after liability recovery error: %v", err)
+	}
+	if wallet.AvailableBalanceMinor != 0 || wallet.ReservedBalanceMinor != 0 || wallet.FinancialHold {
+		t.Fatalf("wallet after liability recovery = %+v, want cleared hold", wallet)
+	}
+}
+
+func TestWalletLiabilityReferenceIsDatabaseUnique(t *testing.T) {
+	store := openBillingTestStore(t)
+	fixture := seedBillingFixture(t, store)
+	service := billingServiceForTest(t, store)
+	ctx := context.Background()
+	var liability Liability
+	err := store.WithTx(ctx, func(q data.Querier) error {
+		var openErr error
+		liability, openErr = service.OpenLiabilityInTx(ctx, q, LiabilityInput{
+			UserID: fixture.user, Currency: "USD", LiabilityType: "payment_refund",
+			ReferenceType: "payment_refund", ReferenceID: "stripe:re_unique_reference", AmountMinor: 10,
+		})
+		return openErr
+	})
+	if err != nil {
+		t.Fatalf("OpenLiabilityInTx() error = %v", err)
+	}
+	_, err = store.Queryer().Exec(ctx, `
+		INSERT INTO wallet_liabilities (
+			id, wallet_id, liability_type, reference_type, reference_id,
+			principal_amount_minor, recovered_amount_minor, currency, status
+		)
+		VALUES ($1, $2, 'payment_refund', 'payment_refund', 'stripe:re_unique_reference', 10, 0, 'USD', 'open')`,
+		uuid.New(), liability.WalletID)
+	if postgresCode(err) != "23505" {
+		t.Fatalf("duplicate liability reference error = %v, code = %q", err, postgresCode(err))
 	}
 }
 

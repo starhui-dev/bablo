@@ -22,7 +22,11 @@ import (
 	"github.com/starhui-dev/bablo/internal/usage"
 )
 
-const billingDurableTimeout = 30 * time.Second
+const (
+	billingDurableTimeout   = 30 * time.Second
+	settlementRecoveryLease = 30 * time.Second
+	settlementRetryDelay    = time.Minute
+)
 
 // Repository owns every wallet row lock and financial transaction boundary.
 type Repository struct {
@@ -43,7 +47,7 @@ type rowScanner interface {
 
 const walletColumns = `
 	id, user_id, currency, available_balance_minor, reserved_balance_minor,
-	status, version, created_at, updated_at`
+	status, financial_hold, version, created_at, updated_at`
 
 func scanWallet(row rowScanner) (Wallet, error) {
 	var value Wallet
@@ -54,6 +58,7 @@ func scanWallet(row rowScanner) (Wallet, error) {
 		&value.AvailableBalanceMinor,
 		&value.ReservedBalanceMinor,
 		&value.Status,
+		&value.FinancialHold,
 		&value.Version,
 		&value.CreatedAt,
 		&value.UpdatedAt,
@@ -234,7 +239,7 @@ func (r *Repository) Reserve(ctx context.Context, input ReserveInput, quote Quot
 		if err != nil {
 			return err
 		}
-		if wallet.Status != "active" {
+		if wallet.Status != "active" || wallet.FinancialHold {
 			return ErrWalletFrozen
 		}
 		if wallet.Currency != quote.Currency {
@@ -426,6 +431,12 @@ func (r *Repository) Settle(ctx context.Context, input SettleInput, now time.Tim
 			extra = actual - reservation.AmountMinor
 		}
 		if wallet.AvailableBalanceMinor < extra {
+			if _, err := q.Exec(dbCtx, `
+				UPDATE wallets
+				SET financial_hold = true, version = version + 1, updated_at = $2
+				WHERE id = $1`, wallet.ID, now); err != nil {
+				return mapRepositoryError(err)
+			}
 			stored, err := upsertSettlement(dbCtx, q, existing, reservation, input.Event, actual, SettlementPending, "insufficient_funds", now)
 			if err != nil {
 				return err
@@ -476,9 +487,17 @@ func (r *Repository) Settle(ctx context.Context, input SettleInput, now time.Tim
 		if _, err := q.Exec(dbCtx, `
 			UPDATE wallets
 			SET available_balance_minor = $2, reserved_balance_minor = $3,
-				version = version + 1, updated_at = $4
+				financial_hold = EXISTS (
+					SELECT 1
+					FROM billing_settlements settlement
+					JOIN wallet_reservations reservation ON reservation.id = settlement.reservation_id
+					WHERE reservation.wallet_id = $1 AND reservation.id <> $4 AND settlement.status = 'pending'
+				) OR EXISTS (
+					SELECT 1 FROM wallet_liabilities
+					WHERE wallet_id = $1 AND status = 'open'
+				), version = version + 1, updated_at = $5
 			WHERE id = $1`,
-			wallet.ID, finalAvailable, finalReserved, now); err != nil {
+			wallet.ID, finalAvailable, finalReserved, reservation.ID, now); err != nil {
 			return mapRepositoryError(err)
 		}
 
@@ -639,86 +658,103 @@ func (r *Repository) Credit(ctx context.Context, input CreditInput, now time.Tim
 	defer cancel()
 	var result LedgerEntry
 	err := r.store.WithTx(dbCtx, func(q data.Querier) error {
-		wallet, err := getOrCreateWallet(dbCtx, q, input.UserID, input.Currency, now)
-		if err != nil {
-			return err
-		}
-		existing, err := loadLedgerByIdempotency(dbCtx, q, wallet.ID, input.IdempotencyKey)
-		switch {
-		case err == nil:
-			if existing.EntryType != input.EntryType || existing.AmountMinor != input.AmountMinor || existing.ReferenceType != input.ReferenceType || existing.ReferenceID != input.ReferenceID || existing.Source != input.Source || !equalUUID(existing.OperatorUserID, input.OperatorUserID) {
-				return ErrSettlementConflict
-			}
-			result = existing
-			return nil
-		case !errors.Is(err, pgx.ErrNoRows):
-			return mapRepositoryError(err)
-		}
-		if wallet.Status == "closed" || (wallet.Status == "frozen" && input.AmountMinor < 0) {
-			return ErrWalletFrozen
-		}
-		availableAfter, ok := safeAdd(wallet.AvailableBalanceMinor, input.AmountMinor)
-		if !ok {
-			return ErrBalanceOverflow
-		}
-		if availableAfter < 0 {
-			return ErrInsufficientFunds
-		}
-		if _, err := q.Exec(dbCtx, `
-			UPDATE wallets
-			SET available_balance_minor = $2, version = version + 1, updated_at = $3
-			WHERE id = $1`, wallet.ID, availableAfter, now); err != nil {
-			return mapRepositoryError(err)
-		}
-		entry, err := insertLedger(dbCtx, q, ledgerInsert{
-			WalletID:                   wallet.ID,
-			EntryType:                  input.EntryType,
-			AmountMinor:                input.AmountMinor,
-			AvailableDeltaMinor:        input.AmountMinor,
-			ReservedDeltaMinor:         0,
-			AvailableBalanceAfterMinor: availableAfter,
-			ReservedBalanceAfterMinor:  wallet.ReservedBalanceMinor,
-			Currency:                   wallet.Currency,
-			ReferenceType:              input.ReferenceType,
-			ReferenceID:                input.ReferenceID,
-			IdempotencyKey:             input.IdempotencyKey,
-			OperatorUserID:             cloneUUID(input.OperatorUserID),
-			Source:                     input.Source,
-			CreatedAt:                  now,
-		})
-		if err != nil {
-			return err
-		}
-		if input.OperatorUserID != nil {
-			if err := audit.Insert(dbCtx, q, audit.Event{
-				ActorUserID: input.OperatorUserID,
-				Action:      "wallet." + input.EntryType,
-				TargetType:  "wallet",
-				TargetID:    wallet.ID.String(),
-				RequestID:   input.ReferenceID,
-				Result:      "success",
-			}); err != nil {
-				return err
-			}
-		}
-		if err := insertBillingOutbox(dbCtx, q, "wallet_ledger", entry.ID, "billing.wallet.credited", input.IdempotencyKey, map[string]any{
-			"ledger_id":      entry.ID,
-			"wallet_id":      wallet.ID,
-			"entry_type":     entry.EntryType,
-			"amount_minor":   entry.AmountMinor,
-			"currency":       entry.Currency,
-			"reference_type": entry.ReferenceType,
-			"reference_id":   entry.ReferenceID,
-		}); err != nil {
-			return err
-		}
-		result = entry
-		return nil
+		var err error
+		result, err = r.CreditInTx(dbCtx, q, input, now)
+		return err
 	})
 	if err != nil {
 		return LedgerEntry{}, err
 	}
 	return result, nil
+}
+
+// CreditInTx appends a validated wallet credit/debit inside a caller-owned
+// transaction. Payment uses it so an order event and its recharge ledger fact
+// commit atomically.
+func (r *Repository) CreditInTx(ctx context.Context, q data.Querier, input CreditInput, now time.Time) (LedgerEntry, error) {
+	if r == nil || q == nil {
+		return LedgerEntry{}, ErrInvalidInput
+	}
+	wallet, err := getOrCreateWallet(ctx, q, input.UserID, input.Currency, now)
+	if err != nil {
+		return LedgerEntry{}, err
+	}
+	existing, err := loadLedgerByIdempotency(ctx, q, wallet.ID, input.IdempotencyKey)
+	switch {
+	case err == nil:
+		if existing.EntryType != input.EntryType || existing.AmountMinor != input.AmountMinor || existing.ReferenceType != input.ReferenceType || existing.ReferenceID != input.ReferenceID || existing.Source != input.Source || !equalUUID(existing.OperatorUserID, input.OperatorUserID) {
+			return LedgerEntry{}, ErrSettlementConflict
+		}
+		return existing, nil
+	case !errors.Is(err, pgx.ErrNoRows):
+		return LedgerEntry{}, mapRepositoryError(err)
+	}
+	if wallet.Status == "closed" || (wallet.Status == "frozen" && input.AmountMinor < 0) {
+		return LedgerEntry{}, ErrWalletFrozen
+	}
+	availableAfter, ok := safeAdd(wallet.AvailableBalanceMinor, input.AmountMinor)
+	if !ok {
+		return LedgerEntry{}, ErrBalanceOverflow
+	}
+	if availableAfter < 0 {
+		return LedgerEntry{}, ErrInsufficientFunds
+	}
+	if _, err := q.Exec(ctx, `
+		UPDATE wallets
+		SET available_balance_minor = $2, version = version + 1, updated_at = $3
+		WHERE id = $1`, wallet.ID, availableAfter, now); err != nil {
+		return LedgerEntry{}, mapRepositoryError(err)
+	}
+	entry, err := insertLedger(ctx, q, ledgerInsert{
+		WalletID:                   wallet.ID,
+		EntryType:                  input.EntryType,
+		AmountMinor:                input.AmountMinor,
+		AvailableDeltaMinor:        input.AmountMinor,
+		ReservedDeltaMinor:         0,
+		AvailableBalanceAfterMinor: availableAfter,
+		ReservedBalanceAfterMinor:  wallet.ReservedBalanceMinor,
+		Currency:                   wallet.Currency,
+		ReferenceType:              input.ReferenceType,
+		ReferenceID:                input.ReferenceID,
+		IdempotencyKey:             input.IdempotencyKey,
+		OperatorUserID:             cloneUUID(input.OperatorUserID),
+		Source:                     input.Source,
+		CreatedAt:                  now,
+	})
+	if err != nil {
+		return LedgerEntry{}, err
+	}
+	if input.OperatorUserID != nil {
+		requestID := input.RequestID
+		if requestID == "" {
+			requestID = input.ReferenceID
+		}
+		if err := audit.Insert(ctx, q, audit.Event{
+			ActorUserID: input.OperatorUserID,
+			Action:      "wallet." + input.EntryType,
+			TargetType:  "wallet",
+			TargetID:    wallet.ID.String(),
+			RequestID:   requestID,
+			Result:      "success",
+		}); err != nil {
+			return LedgerEntry{}, err
+		}
+	}
+	if err := insertBillingOutbox(ctx, q, "wallet_ledger", entry.ID, "billing.wallet.credited", input.IdempotencyKey, map[string]any{
+		"ledger_id":      entry.ID,
+		"wallet_id":      wallet.ID,
+		"entry_type":     entry.EntryType,
+		"amount_minor":   entry.AmountMinor,
+		"currency":       entry.Currency,
+		"reference_type": entry.ReferenceType,
+		"reference_id":   entry.ReferenceID,
+	}); err != nil {
+		return LedgerEntry{}, err
+	}
+	if err := r.recoverWalletLiabilities(ctx, q, wallet, availableAfter, entry.ID, now); err != nil {
+		return LedgerEntry{}, err
+	}
+	return entry, nil
 }
 
 // GetWallet returns the current transaction-maintained projection.
@@ -958,13 +994,17 @@ func persistSettlement(ctx context.Context, q data.Querier, existing Settlement,
 		if err != nil {
 			return Settlement{}, fmt.Errorf("generate settlement UUIDv7: %w", err)
 		}
+		nextAttemptAt := now
+		if status == SettlementPending {
+			nextAttemptAt = now.Add(settlementRetryDelay)
+		}
 		return scanSettlement(q.QueryRow(ctx, `
 			INSERT INTO billing_settlements (
 				id, reservation_id, usage_event_id, idempotency_key,
 				reserved_amount_minor, actual_amount_minor, status, estimated,
-				error_class, created_at, updated_at
+				error_class, next_attempt_at, created_at, updated_at
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
 			RETURNING `+settlementColumns,
 			settlementID,
 			reservation.ID,
@@ -975,15 +1015,21 @@ func persistSettlement(ctx context.Context, q data.Querier, existing Settlement,
 			status,
 			estimated,
 			stringArg(errorClass),
+			nextAttemptAt,
 			now,
 		))
 	}
+	nextAttemptAt := now
+	if status == SettlementPending {
+		nextAttemptAt = now.Add(settlementRetryDelay)
+	}
 	return scanSettlement(q.QueryRow(ctx, `
 		UPDATE billing_settlements
-		SET status = $2, error_class = $3, updated_at = $4
+		SET status = $2, error_class = $3, next_attempt_at = $4,
+			owner_token = NULL, lease_expires_at = NULL, updated_at = $5
 		WHERE id = $1
 		RETURNING `+settlementColumns,
-		existing.ID, status, stringArg(errorClass), now,
+		existing.ID, status, stringArg(errorClass), nextAttemptAt, now,
 	))
 }
 

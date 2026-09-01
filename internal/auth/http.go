@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -27,10 +28,11 @@ const (
 
 // HandlerConfig controls browser-facing authentication transport behavior.
 type HandlerConfig struct {
-	AllowedOrigin string
-	CookieDomain  string
-	CookieSecure  bool
-	SessionTTL    time.Duration
+	AllowedOrigin     string
+	CookieDomain      string
+	CookieSecure      bool
+	SessionTTL        time.Duration
+	TrustedProxyCIDRs []netip.Prefix
 }
 
 // Handler exposes the Bablo Web Session authentication API.
@@ -53,6 +55,7 @@ func NewHandler(service *Service, logger *slog.Logger, cfg HandlerConfig) (*Hand
 		return nil, errors.New("auth HTTP handler requires a positive session TTL")
 	}
 	cfg.AllowedOrigin = strings.TrimSuffix(strings.TrimSpace(cfg.AllowedOrigin), "/")
+	cfg.TrustedProxyCIDRs = append([]netip.Prefix(nil), cfg.TrustedProxyCIDRs...)
 
 	handler := &Handler{service: service, logger: logger, config: cfg, mux: http.NewServeMux()}
 	handler.mux.HandleFunc("POST /api/v1/auth/login", handler.login)
@@ -214,7 +217,7 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		previousToken = cookie.Value
 	}
-	bundle, err := h.service.Login(r.Context(), payload.Email, payload.Password, previousToken, requestMetadata(r))
+	bundle, err := h.service.Login(r.Context(), payload.Email, payload.Password, previousToken, h.requestMetadata(r))
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -290,7 +293,7 @@ func (h *Handler) verifyMFA(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, ErrInvalidInput)
 		return
 	}
-	bundle, err := h.service.VerifyMFA(r.Context(), session, payload.Code, requestMetadata(r))
+	bundle, err := h.service.VerifyMFA(r.Context(), session, payload.Code, h.requestMetadata(r))
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -327,7 +330,7 @@ func (h *Handler) confirmTOTP(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, ErrInvalidInput)
 		return
 	}
-	bundle, recoveryCodes, err := h.service.ConfirmTOTP(r.Context(), session, payload.Code, requestMetadata(r))
+	bundle, recoveryCodes, err := h.service.ConfirmTOTP(r.Context(), session, payload.Code, h.requestMetadata(r))
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -546,23 +549,71 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
 	return nil
 }
 
-func requestMetadata(r *http.Request) LoginMetadata {
-	remoteAddr := r.RemoteAddr
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		remoteAddr = host
-	}
-	if net.ParseIP(remoteAddr) == nil {
-		remoteAddr = ""
-	}
+func (h *Handler) requestMetadata(r *http.Request) LoginMetadata {
+	remoteAddr := trustedClientAddress(r, h.config.TrustedProxyCIDRs)
 	userAgent := r.UserAgent()
 	if len(userAgent) > 512 {
 		userAgent = userAgent[:512]
 	}
 	return LoginMetadata{
-		UserAgent:  userAgent,
-		RemoteAddr: remoteAddr,
-		RequestID:  httpapi.RequestID(r.Context()),
+		UserAgent: userAgent, RemoteAddr: remoteAddr,
+		RequestID: httpapi.RequestID(r.Context()),
 	}
+}
+
+func trustedClientAddress(r *http.Request, trusted []netip.Prefix) string {
+	remote, ok := parseRemoteAddress(r.RemoteAddr)
+	if !ok {
+		return ""
+	}
+	if !addressInPrefixes(remote, trusted) {
+		return remote.String()
+	}
+	forwarded := make([]netip.Addr, 0, 4)
+	for _, header := range r.Header.Values("X-Forwarded-For") {
+		for _, value := range strings.Split(header, ",") {
+			address, err := netip.ParseAddr(strings.TrimSpace(value))
+			if err != nil {
+				return remote.String()
+			}
+			forwarded = append(forwarded, address.Unmap())
+		}
+	}
+	if len(forwarded) == 0 {
+		if address, err := netip.ParseAddr(strings.TrimSpace(r.Header.Get("X-Real-IP"))); err == nil {
+			return address.Unmap().String()
+		}
+		return remote.String()
+	}
+	current := remote
+	for index := len(forwarded) - 1; index >= 0; index-- {
+		if !addressInPrefixes(current, trusted) {
+			return current.String()
+		}
+		current = forwarded[index]
+	}
+	return current.String()
+}
+
+func parseRemoteAddress(value string) (netip.Addr, bool) {
+	host := strings.TrimSpace(value)
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	address, err := netip.ParseAddr(strings.Trim(host, "[]"))
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return address.Unmap(), true
+}
+
+func addressInPrefixes(address netip.Addr, prefixes []netip.Prefix) bool {
+	for _, prefix := range prefixes {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
 }
 
 func sessionView(session Session) sessionResponse {

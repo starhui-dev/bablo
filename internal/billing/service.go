@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/starhui-dev/bablo/internal/data"
 	"github.com/starhui-dev/bablo/internal/pricing"
 	"github.com/starhui-dev/bablo/internal/usage"
 )
@@ -150,6 +151,19 @@ func (s *Service) Credit(ctx context.Context, input CreditInput) (LedgerEntry, e
 	return s.repository.Credit(ctx, normalized, s.now())
 }
 
+// CreditInTx validates and appends a wallet credit/debit inside a transaction
+// owned by another Bablo financial domain.
+func (s *Service) CreditInTx(ctx context.Context, q data.Querier, input CreditInput) (LedgerEntry, error) {
+	if s == nil || s.repository == nil || q == nil {
+		return LedgerEntry{}, fmt.Errorf("%w: billing service is not initialized", ErrInvalidInput)
+	}
+	normalized, err := normalizeCreditInput(input)
+	if err != nil {
+		return LedgerEntry{}, err
+	}
+	return s.repository.CreditInTx(ctx, q, normalized, s.now())
+}
+
 // GetWallet returns the current wallet projection without creating one.
 func (s *Service) GetWallet(ctx context.Context, userID uuid.UUID, currency string) (Wallet, error) {
 	if s == nil || s.repository == nil || userID == uuid.Nil {
@@ -234,6 +248,12 @@ func normalizeCreditInput(input CreditInput) (CreditInput, error) {
 	input.ReferenceType = normalizeText(input.ReferenceType, 64)
 	input.ReferenceID = normalizeText(input.ReferenceID, 160)
 	input.IdempotencyKey = normalizeText(input.IdempotencyKey, 160)
+	if input.RequestID != "" {
+		input.RequestID = normalizeText(input.RequestID, 160)
+		if input.RequestID == "" {
+			return CreditInput{}, ErrInvalidInput
+		}
+	}
 	input.Source = normalizeText(input.Source, 64)
 	if input.Currency == "" || input.ReferenceType == "" || input.ReferenceID == "" || input.IdempotencyKey == "" || input.Source == "" {
 		return CreditInput{}, ErrInvalidInput

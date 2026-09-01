@@ -25,8 +25,8 @@ type ServiceConfig struct {
 	Issuer          string
 	RequireAdminMFA bool
 	SecretBox       *SecretBox
-	LoginLimiter    *LoginLimiter
-	MFALimiter      *LoginLimiter
+	LoginLimiter    AttemptLimiter
+	MFALimiter      AttemptLimiter
 	Now             func() time.Time
 }
 
@@ -37,8 +37,8 @@ type Service struct {
 	issuer          string
 	requireAdminMFA bool
 	secretBox       *SecretBox
-	loginLimiter    *LoginLimiter
-	mfaLimiter      *LoginLimiter
+	loginLimiter    AttemptLimiter
+	mfaLimiter      AttemptLimiter
 	now             func() time.Time
 	dummyHash       string
 }
@@ -58,10 +58,10 @@ func NewService(repository *Repository, cfg ServiceConfig) (*Service, error) {
 		cfg.Now = time.Now
 	}
 	if cfg.LoginLimiter == nil {
-		cfg.LoginLimiter = NewLoginLimiter(8, 5*time.Minute, 10_000)
+		cfg.LoginLimiter = NewMemoryAttemptLimiter(8, 40, 5*time.Minute, 10_000)
 	}
 	if cfg.MFALimiter == nil {
-		cfg.MFALimiter = NewLoginLimiter(8, 5*time.Minute, 10_000)
+		cfg.MFALimiter = NewMemoryAttemptLimiter(8, 40, 5*time.Minute, 10_000)
 	}
 	dummyHash, _, err := HashPassword("Bablo-invalid-password-only")
 	if err != nil {
@@ -123,7 +123,7 @@ func (s *Service) Login(ctx context.Context, email, password, previousToken stri
 		normalized = strings.ToLower(strings.TrimSpace(email))
 	}
 	now := s.now().UTC()
-	if !s.loginLimiter.allow(normalized, meta.RemoteAddr, now) {
+	if !s.loginLimiter.Allow(ctx, normalized, meta.RemoteAddr, now) {
 		_ = s.repository.recordLoginDenied(ctx, nil, meta.RequestID, "denied")
 		return SessionBundle{}, ErrRateLimited
 	}
@@ -157,7 +157,6 @@ func (s *Service) Login(ctx context.Context, email, password, previousToken stri
 	if err != nil {
 		return SessionBundle{}, err
 	}
-	s.loginLimiter.reset(normalized, meta.RemoteAddr)
 	return bundle, nil
 }
 
@@ -341,7 +340,7 @@ func (s *Service) ConfirmTOTP(ctx context.Context, session Session, passcode str
 	if err := s.RequireFullSession(session); err != nil {
 		return SessionBundle{}, nil, err
 	}
-	if !s.mfaLimiter.allow(session.Email, "confirm:"+session.ID.String(), s.now().UTC()) {
+	if !s.mfaLimiter.Allow(ctx, session.Email, meta.RemoteAddr, s.now().UTC()) {
 		return SessionBundle{}, nil, ErrRateLimited
 	}
 	plainCodes, codeHashes, err := generateRecoveryCodes()
@@ -352,7 +351,6 @@ func (s *Service) ConfirmTOTP(ctx context.Context, session Session, passcode str
 	if err != nil {
 		return SessionBundle{}, nil, err
 	}
-	s.mfaLimiter.reset(session.Email, "confirm:"+session.ID.String())
 	return bundle, plainCodes, nil
 }
 
@@ -362,15 +360,13 @@ func (s *Service) VerifyMFA(ctx context.Context, session Session, code string, m
 	if !session.MFARequired() {
 		return SessionBundle{}, ErrMFAUnavailable
 	}
-	limitKey := "verify:" + session.ID.String()
-	if !s.mfaLimiter.allow(session.Email, limitKey, s.now().UTC()) {
+	if !s.mfaLimiter.Allow(ctx, session.Email, meta.RemoteAddr, s.now().UTC()) {
 		return SessionBundle{}, ErrRateLimited
 	}
 	bundle, err := s.rotateWithMFA(ctx, session, code, meta, false, nil)
 	if err != nil {
 		return SessionBundle{}, err
 	}
-	s.mfaLimiter.reset(session.Email, limitKey)
 	return bundle, nil
 }
 

@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-29
+- Implementation update: 2026-09-01
 
 ## Context
 
@@ -17,9 +18,10 @@ Email delivery and an external identity provider are not yet available. Administ
 4. Browser mutations require all of: a valid Session Cookie, exact allowed Origin, a CSRF Cookie matching `X-CSRF-Token`, and the CSRF hash bound to that server-side Session. Production Cookies are Secure; Session is HttpOnly and SameSite=Lax.
 5. RBAC decisions live in `internal/auth.Service`, not the UI or handler. Production cannot disable admin MFA. Admin actions require the `admin` role plus an MFA-enabled, MFA-verified Session.
 6. TOTP enrollment persists an AES-256-GCM encrypted pending secret, requires a valid TOTP confirmation, advances a row-locked counter to reject replay, creates ten hashed 80-bit recovery codes, and rotates the Session. Recovery codes are consumed with a conditional database update.
-7. PostgreSQL is the identity, revocation, MFA, and audit fact source. P0 login/MFA throttling is a bounded, expiring process-local limiter suitable only for the declared single-instance stage. HA requires Redis coordination, but Redis never restores or grants identity state.
-8. Until email/IdP infrastructure exists, trusted local operations use `bablo auth create-admin` and `bablo auth reset-password`. Password input is read from a no-echo terminal or stdin, never argv. Reset revokes all target Sessions and writes audit.
-9. TOTP key material is injected as a 32-byte base64 environment secret with a key version. The schema records key version. Multi-key reads and background re-encryption must be implemented before rotating a production key.
+7. PostgreSQL is the identity, revocation, MFA, and audit fact source. Login and MFA use separate `AttemptLimiter` namespaces with simultaneous account and source-address fixed windows. Production requires Redis and performs both increments atomically in Lua; Redis errors fail closed. Non-production may use a bounded process-local fallback, but Redis never restores or grants identity state.
+8. Forwarded client addresses are accepted only when the direct peer matches an explicit `BABLO_TRUSTED_PROXY_CIDRS` prefix. The trusted chain is peeled from right to left; direct clients cannot self-assert `X-Forwarded-For`.
+9. Until email/IdP infrastructure exists, trusted local operations use `bablo auth create-admin` and `bablo auth reset-password`. Password input is read from a no-echo terminal or stdin, never argv. Reset revokes all target Sessions and writes audit.
+10. TOTP key material is injected as a 32-byte base64 environment secret with a key version. The schema records key version. Multi-key reads and background re-encryption must be implemented before rotating a production key.
 
 ## Consequences
 
@@ -27,7 +29,7 @@ Email delivery and an external identity provider are not yet available. Administ
 - Database disclosure exposes password/Session/recovery hashes and encrypted TOTP material, not reusable plaintext credentials.
 - Administrator accounts can sign in before enrollment but cannot execute admin operations until TOTP is confirmed.
 - Password reset remains operational without pretending email delivery exists, but requires trusted host/database access and is unsuitable as end-user self-service.
-- Process-local throttling is intentionally simple and observable for P0; multi-instance deployment is blocked until coordinated throttling is implemented.
+- Production throttling is cross-instance and fail-closed. Redis loss can deny new login/MFA attempts but cannot grant identity, revive Sessions, or bypass PostgreSQL authorization; direct-client header spoofing cannot rotate the source-address bucket.
 - Losing the only active MFA encryption key makes TOTP and recovery verification unavailable. Production key rotation therefore requires multi-version decryption and a tested re-encryption runbook.
 
 ## Rejected alternatives

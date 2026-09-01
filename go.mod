@@ -9,6 +9,7 @@ require (
 	github.com/pressly/goose/v3 v3.27.3
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/router-for-me/CLIProxyAPI/v7 v7.2.145
+	github.com/stripe/stripe-go/v86 v86.2.0
 	golang.org/x/crypto v0.54.0
 	golang.org/x/term v0.45.0
 )

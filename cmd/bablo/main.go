@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,6 +17,7 @@ import (
 	"github.com/starhui-dev/bablo/internal/data"
 	"github.com/starhui-dev/bablo/internal/httpapi"
 	"github.com/starhui-dev/bablo/internal/inference/cpa"
+	"github.com/starhui-dev/bablo/internal/payment"
 	"github.com/starhui-dev/bablo/internal/proxy"
 	"github.com/starhui-dev/bablo/internal/scheduler"
 	"github.com/starhui-dev/bablo/internal/secret"
@@ -55,19 +57,35 @@ func run(arguments []string) int {
 		logger.Error("bablo_credential_config_error", "error", err)
 		return 1
 	}
+	paymentCfg, err := config.LoadPayment(cfg.Environment)
+	if err != nil {
+		logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+		logger.Error("bablo_payment_config_error", "error", err)
+		return 1
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	var store *data.Store
 	var authHandler *auth.Handler
 	var redisReady bool
 	var serverOptions []httpapi.Option
 	var credentialKeys *secret.Keyring
+	var voucherKeys *secret.Keyring
 	var catalog *catalogRuntime
 	var schedulerCoordinator scheduler.Coordinator
 	var cpaAdapter *cpa.Adapter
+	var billingService *billing.Service
+	var paymentService *payment.Service
 	if len(credentialCfg.Keys) > 0 {
 		credentialKeys, err = secret.NewKeyring(credentialCfg.CurrentVersion, credentialCfg.Keys)
 		if err != nil {
 			logger.Error("bablo_credential_keyring_error", "error", err)
+			return 1
+		}
+	}
+	if paymentCfg.VoucherEnabled {
+		voucherKeys, err = secret.NewKeyring(paymentCfg.VoucherCurrentVersion, paymentCfg.VoucherKeys)
+		if err != nil {
+			logger.Error("bablo_payment_voucher_keyring_error", "error", err)
 			return 1
 		}
 	}
@@ -87,6 +105,36 @@ func run(arguments []string) int {
 				logger.Error("bablo_auth_secretbox_error", "error", err)
 				return 1
 			}
+			var loginLimiter, mfaLimiter auth.AttemptLimiter
+			if cfg.RedisURL != "" {
+				limiterCtx, limiterCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				loginLimiter, err = auth.NewRedisAttemptLimiter(limiterCtx, cfg.RedisURL, "login", 8, 40, 5*time.Minute)
+				limiterCancel()
+				if err != nil {
+					logger.Error("bablo_auth_login_limiter_error", "error", err)
+					return 1
+				}
+				limiterCtx, limiterCancel = context.WithTimeout(context.Background(), 10*time.Second)
+				mfaLimiter, err = auth.NewRedisAttemptLimiter(limiterCtx, cfg.RedisURL, "mfa", 8, 40, 5*time.Minute)
+				limiterCancel()
+				if err != nil {
+					_ = loginLimiter.Close()
+					logger.Error("bablo_auth_mfa_limiter_error", "error", err)
+					return 1
+				}
+				redisReady = true
+			} else {
+				loginLimiter = auth.NewMemoryAttemptLimiter(8, 40, 5*time.Minute, 10_000)
+				mfaLimiter = auth.NewMemoryAttemptLimiter(8, 40, 5*time.Minute, 10_000)
+			}
+			defer func() {
+				if closeErr := loginLimiter.Close(); closeErr != nil {
+					logger.Error("bablo_auth_login_limiter_close_error", "error", closeErr)
+				}
+				if closeErr := mfaLimiter.Close(); closeErr != nil {
+					logger.Error("bablo_auth_mfa_limiter_close_error", "error", closeErr)
+				}
+			}()
 			repository, err := auth.NewRepository(store)
 			if err != nil {
 				logger.Error("bablo_auth_repository_error", "error", err)
@@ -97,22 +145,88 @@ func run(arguments []string) int {
 				Issuer:          authCfg.Issuer,
 				RequireAdminMFA: authCfg.RequireAdminMFA,
 				SecretBox:       secretBox,
+				LoginLimiter:    loginLimiter,
+				MFALimiter:      mfaLimiter,
 			})
 			if err != nil {
 				logger.Error("bablo_auth_service_error", "error", err)
 				return 1
 			}
 			authHandler, err = auth.NewHandler(service, logger, auth.HandlerConfig{
-				AllowedOrigin: authCfg.AllowedOrigin,
-				CookieDomain:  authCfg.CookieDomain,
-				CookieSecure:  authCfg.CookieSecure,
-				SessionTTL:    authCfg.SessionTTL,
+				AllowedOrigin:     authCfg.AllowedOrigin,
+				CookieDomain:      authCfg.CookieDomain,
+				CookieSecure:      authCfg.CookieSecure,
+				SessionTTL:        authCfg.SessionTTL,
+				TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
 			})
 			if err != nil {
 				logger.Error("bablo_auth_handler_error", "error", err)
 				return 1
 			}
 			serverOptions = append(serverOptions, httpapi.WithAuthHandler(authHandler))
+		}
+
+		billingRepository, billingErr := billing.NewRepository(store)
+		if billingErr != nil {
+			logger.Error("bablo_billing_repository_error", "error", billingErr)
+			return 1
+		}
+		billingService, billingErr = billing.NewService(billingRepository)
+		if billingErr != nil {
+			logger.Error("bablo_billing_service_error", "error", billingErr)
+			return 1
+		}
+		paymentProviders := make([]payment.Provider, 0, 2)
+		if paymentCfg.FixtureEnabled {
+			fixtureProvider, fixtureErr := payment.NewFixtureProvider(payment.FixtureProviderConfig{
+				MerchantID: paymentCfg.FixtureMerchant,
+				Secret:     paymentCfg.FixtureSecret,
+				Tolerance:  paymentCfg.WebhookTolerance,
+			})
+			if fixtureErr != nil {
+				logger.Error("bablo_payment_fixture_error", "error", fixtureErr)
+				return 1
+			}
+			paymentProviders = append(paymentProviders, fixtureProvider)
+		}
+		if paymentCfg.StripeEnabled {
+			stripeProvider, stripeErr := payment.NewStripeProvider(payment.StripeProviderConfig{
+				SecretKey: paymentCfg.StripeSecretKey, WebhookSecret: paymentCfg.StripeWebhookSecret,
+				SuccessURL: paymentCfg.StripeSuccessURL, CancelURL: paymentCfg.StripeCancelURL,
+				AccountID: paymentCfg.StripeAccountID, Tolerance: paymentCfg.WebhookTolerance,
+			})
+			if stripeErr != nil {
+				logger.Error("bablo_payment_stripe_error", "error", stripeErr)
+				return 1
+			}
+			paymentProviders = append(paymentProviders, stripeProvider)
+		}
+		paymentRegistry, paymentErr := payment.NewRegistry(paymentProviders...)
+		if paymentErr != nil {
+			logger.Error("bablo_payment_registry_error", "error", paymentErr)
+			return 1
+		}
+		paymentRepository, paymentErr := payment.NewRepository(store, billingService, voucherKeys)
+		if paymentErr != nil {
+			logger.Error("bablo_payment_repository_error", "error", paymentErr)
+			return 1
+		}
+		paymentService, paymentErr = payment.NewService(paymentRepository, billingService, paymentRegistry, payment.Options{OrderTTL: paymentCfg.OrderTTL})
+		if paymentErr != nil {
+			logger.Error("bablo_payment_service_error", "error", paymentErr)
+			return 1
+		}
+		paymentHandler, paymentErr := payment.NewHandler(paymentService, logger)
+		if paymentErr != nil {
+			logger.Error("bablo_payment_handler_error", "error", paymentErr)
+			return 1
+		}
+		serverOptions = append(serverOptions, httpapi.WithPaymentWebhookHandler(http.HandlerFunc(paymentHandler.ServeWebhookHTTP)))
+		if authHandler != nil {
+			serverOptions = append(serverOptions,
+				httpapi.WithPaymentUserHandler(authHandler.Protect(http.HandlerFunc(paymentHandler.ServeUserHTTP))),
+				httpapi.WithPaymentAdminHandler(authHandler.ProtectRole(http.HandlerFunc(paymentHandler.ServeAdminHTTP), "admin")),
+			)
 		}
 
 		var limiter apikey.Limiter
@@ -203,16 +317,6 @@ func run(arguments []string) int {
 				logger.Error("bablo_usage_service_error", "error", usageErr)
 				return 1
 			}
-			billingRepository, billingErr := billing.NewRepository(store)
-			if billingErr != nil {
-				logger.Error("bablo_billing_repository_error", "error", billingErr)
-				return 1
-			}
-			billingService, billingErr := billing.NewService(billingRepository)
-			if billingErr != nil {
-				logger.Error("bablo_billing_service_error", "error", billingErr)
-				return 1
-			}
 
 			cpaAdapter, err = cpa.NewService(cpa.ServiceOptions{ConfigPath: cfg.CPAConfigPath})
 			if err != nil {
@@ -263,8 +367,8 @@ func run(arguments []string) int {
 	} else if cfg.CPAConfigPath != "" {
 		logger.Error("bablo_inference_config_error", "error", "BABLO_DATABASE_URL is required when BABLO_CPA_CONFIG_PATH is configured")
 		return 1
-	} else if len(authCfg.EncryptionKey) > 0 || credentialKeys != nil {
-		logger.Error("bablo_secret_database_error", "error", "BABLO_DATABASE_URL is required when authentication or Credential storage is configured")
+	} else if len(authCfg.EncryptionKey) > 0 || credentialKeys != nil || paymentCfg.FixtureEnabled || paymentCfg.StripeEnabled || paymentCfg.VoucherEnabled {
+		logger.Error("bablo_secret_database_error", "error", "BABLO_DATABASE_URL is required when authentication, Credential storage, or payments are configured")
 		return 1
 	}
 
@@ -284,6 +388,12 @@ func run(arguments []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if paymentService != nil {
+		go paymentService.RunExpirationWorker(ctx, paymentCfg.ExpirationInterval, logger)
+	}
+	if billingService != nil {
+		go billingService.RunSettlementRecoveryWorker(ctx, time.Minute, logger)
+	}
 
 	errCh := make(chan error, 1)
 	go func() {

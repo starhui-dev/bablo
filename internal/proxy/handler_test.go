@@ -617,8 +617,14 @@ func TestHandlerRecordsResolvedUsageFact(t *testing.T) {
 	if finalization.TerminalStatus != usage.StatusSucceeded || finalization.Usage != (usage.TokenUsage{InputTokens: 12, OutputTokens: 8, CacheReadTokens: 3}) {
 		t.Fatalf("usage finalization = %+v", finalization)
 	}
-	if finalization.ResolvedModelID == nil || *finalization.ResolvedModelID != uuid.MustParse("33333333-3333-7333-8333-333333333333") || finalization.CredentialID == nil {
-		t.Fatalf("resolved route in usage = %+v", finalization)
+	selection := schedulerService.selection
+	if finalization.ResolvedModelID == nil || *finalization.ResolvedModelID != uuid.MustParse("33333333-3333-7333-8333-333333333333") ||
+		finalization.RouteVersionID == nil || *finalization.RouteVersionID != selection.Target.RouteVersionID ||
+		finalization.ProviderID == nil || *finalization.ProviderID != selection.Target.ProviderID ||
+		finalization.ProviderModelID == nil || *finalization.ProviderModelID != selection.Target.ProviderModelID ||
+		finalization.CredentialID == nil || *finalization.CredentialID != selection.CredentialID ||
+		finalization.UpstreamStatus == nil || *finalization.UpstreamStatus != http.StatusOK {
+		t.Fatalf("resolved route in usage = %+v, selection = %+v", finalization, selection)
 	}
 	if len(schedulerService.calls) != 1 || schedulerService.calls[0].RequestRecordID == nil || *schedulerService.calls[0].RequestRecordID != recorder.handle.RecordID {
 		t.Fatalf("scheduler request record id = %+v", schedulerService.calls)
@@ -816,7 +822,7 @@ func TestHandlerRecordsStreamUsageAndTTFT(t *testing.T) {
 		t.Fatalf("usage finalizations = %d, want 1", len(recorder.finalizations))
 	}
 	finalization := recorder.finalizations[0]
-	if finalization.TerminalStatus != usage.StatusSucceeded || finalization.Usage.InputTokens != 5 || finalization.Usage.OutputTokens != 2 || finalization.TTFT == nil {
+	if finalization.TerminalStatus != usage.StatusSucceeded || finalization.Usage.InputTokens != 5 || finalization.Usage.OutputTokens != 2 || finalization.TTFT == nil || finalization.UpstreamStatus == nil || *finalization.UpstreamStatus != http.StatusOK {
 		t.Fatalf("stream usage finalization = %+v", finalization)
 	}
 }

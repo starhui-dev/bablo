@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,7 +34,7 @@ func TestMigrationsUpgradeAndRepeatSafely(t *testing.T) {
 	if _, err := provider.Up(ctx); err != nil {
 		t.Fatalf("upgrade to latest: %v", err)
 	}
-	if version, err := provider.GetDBVersion(ctx); err != nil || version != 11 {
+	if version, err := provider.GetDBVersion(ctx); err != nil || version != 18 {
 		t.Fatalf("version after upgrade = %d, %v", version, err)
 	}
 	results, err := provider.Up(ctx)
@@ -53,19 +54,19 @@ func TestLatestMigrationDownAndUp(t *testing.T) {
 	if err := Migrate(ctx, url, migrations.Files, logger); err != nil {
 		t.Fatalf("Migrate() error = %v", err)
 	}
-	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 11 {
+	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 18 {
 		t.Fatalf("version before rollback = %d, %v", version, err)
 	}
 	if err := MigrateDown(ctx, url, migrations.Files, logger); err != nil {
 		t.Fatalf("MigrateDown() error = %v", err)
 	}
-	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 10 {
+	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 17 {
 		t.Fatalf("version after rollback = %d, %v", version, err)
 	}
 	if err := Migrate(ctx, url, migrations.Files, logger); err != nil {
 		t.Fatalf("Migrate() after rollback error = %v", err)
 	}
-	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 11 {
+	if version, err := latestMigrationVersion(ctx, url); err != nil || version != 18 {
 		t.Fatalf("version after restore = %d, %v", version, err)
 	}
 }
@@ -121,6 +122,50 @@ func TestUsageMigrationBackfillsTimeSnapshot(t *testing.T) {
 	}
 	if !gotStartedAt.Equal(startedAt) || !gotFinishedAt.Equal(finishedAt) {
 		t.Fatalf("backfilled timestamps = %v/%v, want %v/%v", gotStartedAt, gotFinishedAt, startedAt, finishedAt)
+	}
+}
+
+func TestPaymentIdentityMigrationRequiresOperatorBackfill(t *testing.T) {
+	url := testDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	provider, err := newMigrationProvider(url, migrations.Files, logger)
+	if err != nil {
+		t.Fatalf("newMigrationProvider() error = %v", err)
+	}
+	defer func() { _ = provider.Close() }()
+	if _, err := provider.UpTo(ctx, 14); err != nil {
+		t.Fatalf("upgrade to v14: %v", err)
+	}
+	store, err := Open(ctx, Config{URL: url, MaxConns: 2})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	userID := newTestUUID(t)
+	orderID := newTestUUID(t)
+	if _, err := store.Queryer().Exec(ctx, `
+		INSERT INTO users (id, email_normalized, password_hash, password_params_version)
+		VALUES ($1, $2, 'hash', 'argon2id-v1')`, userID, userID.String()+"@example.test"); err != nil {
+		store.Close()
+		t.Fatalf("seed migration user: %v", err)
+	}
+	if _, err := store.Queryer().Exec(ctx, `
+		INSERT INTO payment_orders (
+			id, order_no, user_id, amount_minor, currency, payment_provider,
+			provider_trade_no, merchant_id, status, idempotency_key
+		)
+		VALUES ($1, $2, $3, 100, 'USD', 'stripe', $4, 'acct_review_required', 'pending', $5)`,
+		orderID, "bablo_pay_"+orderID.String(), userID, "cs_"+orderID.String(), "migration-"+orderID.String()); err != nil {
+		store.Close()
+		t.Fatalf("seed legacy payment order: %v", err)
+	}
+	store.Close()
+	if _, err := provider.UpTo(ctx, 15); err == nil || !strings.Contains(err.Error(), "payment provider identity backfill required") {
+		t.Fatalf("upgrade to v15 error = %v, want operator backfill blocker", err)
+	}
+	if version, err := provider.GetDBVersion(ctx); err != nil || version != 14 {
+		t.Fatalf("version after blocked upgrade = %d, %v", version, err)
 	}
 }
 

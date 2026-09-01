@@ -41,3 +41,34 @@ func TestLoadAuthNormalizesSafeSettings(t *testing.T) {
 		t.Fatalf("LoadAuth() origin=%q ttl=%v secure=%v key_bytes=%d", cfg.AllowedOrigin, cfg.SessionTTL, cfg.CookieSecure, len(cfg.EncryptionKey))
 	}
 }
+
+func TestLoadProductionRequiresRedis(t *testing.T) {
+	t.Setenv("BABLO_ENV", "production")
+	t.Setenv("BABLO_REDIS_URL", "")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "BABLO_REDIS_URL") {
+		t.Fatalf("Load() error = %v, want missing production Redis", err)
+	}
+	t.Setenv("BABLO_REDIS_URL", "redis://redis:6379/0")
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with Redis error = %v", err)
+	}
+	if config.RedisURL != "redis://redis:6379/0" {
+		t.Fatalf("Load() RedisURL = %q", config.RedisURL)
+	}
+}
+
+func TestTrustedProxyCIDRsRequireValidExplicitPrefixes(t *testing.T) {
+	t.Setenv("BABLO_TRUSTED_PROXY_CIDRS", "10.0.0.0/8, 192.0.2.7/24,10.0.0.0/8")
+	prefixes, err := prefixListEnv("BABLO_TRUSTED_PROXY_CIDRS")
+	if err != nil {
+		t.Fatalf("prefixListEnv() error = %v", err)
+	}
+	if len(prefixes) != 2 || prefixes[0].String() != "10.0.0.0/8" || prefixes[1].String() != "192.0.2.0/24" {
+		t.Fatalf("trusted proxy prefixes = %#v", prefixes)
+	}
+	t.Setenv("BABLO_TRUSTED_PROXY_CIDRS", "not-a-prefix")
+	if _, err := prefixListEnv("BABLO_TRUSTED_PROXY_CIDRS"); err == nil {
+		t.Fatal("invalid trusted proxy prefix was accepted")
+	}
+}

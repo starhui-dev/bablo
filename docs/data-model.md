@@ -1,6 +1,6 @@
 # Bablo 数据模型规划
 
-> 已由 `migrations/000001_initial_schema.sql`、`000002_fact_table_guards.sql`、`000003_wallet_payment_integrity.sql` 与 `000004_auth_security.sql` 落地；后续迁移必须新增版本文件，不得重写已应用文件。
+> 已由 `migrations/000001_initial_schema.sql` 至 `000018_billing_liability_integrity.sql` 增量落地；后续迁移必须新增版本文件，不得重写已应用文件。
 > 日期：2026-08-29
 > 事实来源：PostgreSQL；Redis 只存可重建状态
 
@@ -39,6 +39,12 @@ erDiagram
     WALLETS ||--o{ WALLET_LEDGER : records
     USERS ||--o{ PAYMENT_ORDERS : places
     PAYMENT_ORDERS ||--o{ PAYMENT_EVENTS : receives
+    PAYMENT_ORDERS ||--o{ PAYMENT_PROVIDER_OPERATIONS : executes
+    PAYMENT_ORDERS ||--o{ PAYMENT_EXTERNAL_REFUNDS : reconciles
+    PAYMENT_ORDERS ||--o{ PAYMENT_DISPUTES : disputes
+    WALLETS ||--o{ WALLET_LIABILITIES : recovers
+    WALLET_LIABILITIES ||--o| PAYMENT_EXTERNAL_REFUNDS : explains
+    WALLET_LIABILITIES ||--o| PAYMENT_DISPUTES : explains
     USAGE_EVENTS }o--|| PRICE_VERSIONS : priced_by
     USAGE_EVENTS }o--|| WALLETS : charges
     USAGE_EVENTS }o--|| API_KEYS : attributed_to
@@ -92,12 +98,18 @@ erDiagram
 
 ### Wallet / payment / audit
 
-- `wallets`：user、currency、`available_balance_minor`、`reserved_balance_minor`、status、version；两种余额都是 transaction 内维护、可由 ledger delta 重建的投影，均不得为负；
+- `wallets`：user、currency、`available_balance_minor`、`reserved_balance_minor`、status、`financial_hold`、version；两种余额都是 transaction 内维护、可由 ledger delta 重建的投影，均不得为负；open liability 或 pending settlement 时 hold 阻止新 reservation；
 - `wallet_reservations`：request/wallet/user/key、request record、resolved model/provider model/route/provider/credential、已发布 price version、预估 token、预留金额、状态和最终 UsageEvent；同一 request 的载荷不可漂移；
-- `billing_settlements`：reservation、UsageEvent、reserved/actual amount、estimated、status/error 和幂等键；`pending` 表示最终金额暂时无法完整扣除，保留 reservation 等待重试/对账；
-- `wallet_ledger`：wallet、entry type、signed amount、available/reserved delta、两种 balance-after snapshot、currency、reference、idempotency key、UsageEvent/operator/source、created_at；追加式，delta 是重建权威；
-- `payment_orders`：全局 order no、user、amount/currency、provider、provider trade no、状态机 `created -> pending -> paid/failed/expired/refunded/closed`；
-- `payment_events`：provider event/trade ID、原始 payload hash（非必要正文）、验签结果、received_at、处理状态；
+- `billing_settlements`：reservation、UsageEvent、reserved/actual amount、estimated、status/error、幂等键、retry attempt 和短租约；`pending` 保留 reservation，后续充值/worker 以 owner token 重试；
+- `wallet_ledger`：wallet、entry type、signed amount、available/reserved delta、两种 balance-after snapshot、currency、reference、idempotency key、UsageEvent/operator/source、created_at；追加式，delta 是重建权威；`payment_liability` 同时表达追偿扣款与胜诉反向入账；
+- `wallet_liabilities`：wallet、`payment_refund|payment_dispute`、稳定 Provider reference、principal/recovered、currency、`open|settled|reversed`；允许 recovered 单调增加或 settled -> reversed，不允许删除/改写身份；
+- `payment_orders`：全局 order no、user、amount/currency、provider、merchant/live mode、Checkout Session/trade、PaymentIntent、Charge、refund、safe checkout data、external refunded total 和本地账本引用；状态机覆盖 create/pay/close、Bablo 发起退款和外部全额退款；
+- `payment_events`：provider event/trade/refund/payment-intent/charge/dispute ID、payload SHA-256（不保存支付正文）、merchant/live mode、验签来源、occurred/received time；verified fact 追加式，processing state 独立更新；
+- `payment_provider_operations`：order + create/refund、payload hash、merchant/live mode、owner lease、attempt/backoff、Provider reference；持久化 Provider 调用单飞与崩溃恢复；
+- `payment_external_refunds`：Provider refund immutable fact，关联 order 与 liability，记录金额/币种和 Provider object ID；
+- `payment_disputes`：Provider dispute、order、liability、charge/payment-intent、金额/币种、`open -> won|lost`；胜诉反转 liability，败诉保留追偿；
+- `payment_funding_operations`：人工充值全局幂等事实，绑定 operator、目标用户、币种、金额和唯一 ledger；
+- `payment_vouchers`：code SHA-256/prefix、amount/currency、状态/过期、创建/兑换主体及版本化 AEAD 密文；明文创建响应可在未兑换前按同一幂等请求重放，兑换后清除密文；
 - `audit_logs`：actor、action、target、before/after 摘要（脱敏）、request ID、result、created_at；
 - `stats_rollups`：按小时/天和受控维度聚合，必须可由 Usage/Ledger 重建，不是事实源。
 
@@ -122,8 +134,14 @@ erDiagram
 | wallet reservation | `request_id`、`(wallet_id, reservation_key)`、非空 `usage_event_id` 均唯一；同一 request 的 owner/route/price/estimate/amount 必须一致 |
 | billing settlement | `reservation_id`、`usage_event_id`、`idempotency_key` 分别唯一；重复 settle 返回同一状态 |
 | wallet ledger | `(wallet_id, idempotency_key)`；非空 `usage_event_id` 全局唯一，充值/退款/调账 reference 由调用方稳定派生 |
-| payment order | `order_no`；外部 trade no 在 provider scope 内唯一 |
-| payment event | `(payment_provider, provider_event_id)`；防重放 |
+| payment order | `order_no`、服务端财务 idempotency key；`(provider, trade/payment_intent/charge/refund)` 在相应非空列上唯一；merchant/live mode 一旦赋值不可改变 |
+| payment event | `(payment_provider, provider_event_id)`；同 event ID 必须保持 payload hash、所有 Provider object ID、merchant/live mode 和业务事实完全一致 |
+| payment provider operation | `(payment_order_id, operation_type)`；payload hash + merchant/live mode 固定；owner token + lease 控制单飞重试 |
+| external refund | `(payment_provider, provider_refund_no)`；每条事实唯一绑定一个 liability |
+| dispute | `(payment_provider, provider_dispute_no)`；每条争议唯一绑定一个 liability，终态不可再次转换 |
+| wallet liability | `(reference_type, reference_id)`；恢复 ledger idempotency key 由 liability + credit source ledger 派生 |
+| funding operation | 全局 `idempotency_key`；重放必须匹配 operator/user/currency/amount |
+| payment voucher | `code_hash` 与 create idempotency key 唯一；redeem 在 voucher 行锁 + wallet 行锁事务内只成功一次 |
 | scheduler decision | `(request_id, attempt_no, decision_no)` |
 | audit | `event_id` 或 `(request_id, actor, action, target, nonce)` 按实现选定 |
 | outbox | `(aggregate_type, aggregate_id, event_type, idempotency_key)`；processing claim 绑定 `claimed_by` owner token |
@@ -132,13 +150,16 @@ erDiagram
 
 ## 5. 并发与账务不变量
 
-1. reservation 使用 API-key advisory transaction lock 串行化 daily/monthly budget，再锁 wallet 行把 available 转入 reserved；不能先读余额再普通 UPDATE；
+1. reservation 使用 API-key advisory transaction lock 串行化 daily/monthly budget，再锁 wallet 行把 available 转入 reserved；`financial_hold=true` 时拒绝新 reservation；
 2. 任何 ledger entry 成功提交都必须有唯一 idempotency key；重试不新增第二笔，管理员调账同时写 audit；
-3. reservation、usage charge、release 的 available/reserved delta 必须满足 entry-type 代数约束；`SUM(delta)` 必须重建钱包投影，数据库拒绝历史 ledger UPDATE/DELETE；
-4. settle 少收释放、多收补扣；补扣余额不足时保留 reserved 并写 pending settlement/outbox，不能把差额静默记为免费或形成负余额；
-5. `usage_events`、`payment_events`、`audit_logs` 不 UPDATE 既有事实来“修正”；新增 adjustment/reconciliation；
+3. reservation、usage charge、release、refund hold/reversal/liability 的 available/reserved delta 必须满足 entry-type 代数约束；`SUM(delta)` 必须重建钱包投影，数据库拒绝历史 ledger UPDATE/DELETE；
+4. settle 少收释放、多收补扣；补扣余额不足时保留 reserved 并写 pending settlement/outbox。后续 credit 在 wallet 事务内按 FIFO 恢复 open liability；独立 worker 以 owner lease 重试 pending settlement，任一欠费存在时 `financial_hold` 持续生效；不能静默免费或形成负余额；
+5. `usage_events`、`payment_events`、外部退款事实和 `audit_logs` 不 UPDATE 既有事实来“修正”；新增 adjustment/reconciliation/liability/reversal；
 6. price version 切换只影响新请求；reservation 和 UsageEvent 必须绑定同一已发布版本、wallet、request 和 owner；
-7. Redis 丢失不改变 PostgreSQL 账务；Redis lease/限流重建后不能绕过 DB 权限和预算事实。
+7. Provider refund 调用前以 ledger hold 把 available 转为 reserved；verified success 消费，definitive failure 释放，timeout/未知结果保持 pending；Provider operation 的 merchant/live mode 与 payload hash 在所有重试中不变；
+8. 签名有效的支付事件必须核对金额、币种、merchant/live mode，并要求所有本地已有的 order/trade/refund/payment-intent/charge 标识同时一致；外部退款/争议通过 liability 追偿；
+9. Stripe browser redirect 不改变订单或钱包，只有验签 webhook 或经认证 Provider API reconciliation 可入账；
+10. Redis 丢失不改变 PostgreSQL 账务；Redis lease/限流重建后不能绕过 DB 权限、预算和 financial hold。
 
 ## 6. 索引、保留与迁移
 
@@ -157,6 +178,10 @@ Raw Usage、scheduler/audit、payment payload hash 和 rollup 的 retention 必�
 - `migrations/000009_scheduler_integrity.sql` 增加 Credential 并发容量约束、Scheduler 决策选中路由/provider/credential 关联字段、历史兼容约束和数据库选择一致性 trigger；Scheduler 运行态仍由 Redis TTL 状态协调。
 - `migrations/000010_usage_integrity.sql` 增加 Usage `request_id` 唯一索引、started/finished 时间快照、request-record 关联与 settlement/request/source/claim-owner 输入约束；从 v9 回填历史 Usage 时间并恢复 append-only trigger，outbox claim/retry/publish 由 `internal/usage` 以 owner token 和 stale lease 实现。
 - `migrations/000011_billing_integrity.sql` 增加 reservation/settlement、explicit available/reserved ledger delta、balance-after snapshot、published-price/owner/Usage cross-table guard、ledger immutability、API-key budget 与 settlement 查询索引；migration 已验证空 schema up、latest down 和重放。
+- `migrations/000012_payment_integrity.sql` 至 `000015_payment_merchant_mode.sql` 增加 Payment 状态机、event processing、voucher replay、Provider operation、退款 hold、merchant/live-mode 绑定与历史身份回填阻塞；
+- `migrations/000016_payment_financial_recovery.sql` 增加 pending settlement recovery lease、wallet financial hold、liability 和人工充值幂等事实；
+- `migrations/000017_payment_provider_recovery.sql` 增加 PaymentIntent/Charge/Dispute、external refund/dispute 表及 order-wallet-ledger 跨表约束；
+- `migrations/000018_billing_liability_integrity.sql` 以数据库唯一约束保证一个 Provider financial reference 只能产生一条 liability；
 - `internal/model` 实现 canonical ID/alias 解析、public/admin 列表、能力/visibility/billing class 校验和 route readiness；alias 禁用后不被重新分配。
 - `internal/provider` 实现资源政策、上游模型映射和完整 discovery snapshot reconcile；新增发现 pending/disabled，缺失只改变 discovery signal，批准配置不被发现覆盖。
 - `internal/credential` 实现 non-secret DTO、AES-GCM secret create/rotate/reencrypt、active runtime source、monotonic health、Provider pool membership 和 opaque composite cursor；管理员 API 永不返回 secret value。
@@ -164,5 +189,5 @@ Raw Usage、scheduler/audit、payment payload hash 和 rollup 的 retention 必�
 - `internal/route` 实现 P0 exact route、多 Provider/Pool candidate、snapshot hash、active version 原子切换、opaque cursor、preview/resolution 和管理员 API；resolver 只产出 scheduler candidates，不选择 Credential。
 - `internal/scheduler` 实现 target/member 硬过滤、429 cooldown、quota freshness/reset、priority/fill-first/round-robin/weighted-round-robin/quota-aware、有限 affinity、Redis/内存 TTL lease/cursor/affinity 和 immutable Decision Log；它只接收 Route resolution，不暴露 CPA 类型。
 - `internal/usage` 实现 request record 幂等、immutable UsageEvent、stream/cancel/no-usage 状态、late reconciliation、transactional outbox claim/ack/retry；Proxy 只提交领域输入，不暴露 CPA 类型或正文。
-- `internal/billing` 使用 decimal string + `math/big` 汇总后一次换算最小货币单位，实现 Quote/Reserve/Settle/Release/Credit/GetWallet/RebuildBalance；Proxy 在 CPA 执行前 reserve、UsageEvent 后 settle，missing usage 按 reservation 估算结算而不静默免费。
-- `cmd/bablo/catalog.go` 将用户模型目录和 admin model/provider/price/route handlers 接入 Web Session/RBAC；`Store.WithTx` 保持 repository 事务边界，应用启动不自动迁移。
+- `internal/billing` 使用 decimal string + `math/big` 汇总后一次换算最小货币单位，实现 Quote/Reserve/Settle/Release/Credit、payment refund hold、liability、pending settlement recovery、GetWallet/RebuildBalance；Proxy 在 CPA 执行前 reserve、UsageEvent 后 settle，missing usage 按 reservation 估算结算；
+- `internal/payment` 实现订单/退款/外部退款/争议、Stripe 与 fixture adapter、Provider operation/reconciliation/expiration worker、voucher 和人工充值；`cmd/bablo` 接入支付 HTTP 与恢复 worker，应用启动不自动迁移。

@@ -77,7 +77,7 @@ bablo auth reset-password --email user@example.com
 - `GET /api/v1/me/models`（已由模型阶段实现为 `/api/v1/models`）
 - `GET /api/v1/me/usage`（stats/user 阶段）
 - `GET /api/v1/me/wallet`、`GET /api/v1/me/wallet/ledger`（Billing 领域服务已实现；HTTP surface 后置到 user/admin 阶段，当前未挂载）
-- `GET /api/v1/me/payment-orders/{order_no}`（payment 阶段）
+- `GET /api/v1/me/payment-orders/{order_no}`（已实现，只返回当前用户订单）
 
 以上 Key 管理接口只接受现有 Web Session：所有方法要求 full session，POST/PATCH 继续要求精确 Origin、CSRF Cookie 与 `X-CSRF-Token`。用户查询和修改条件始终包含 session user ID；其他用户的 Key 返回 `not_found`。响应统一 `Cache-Control: no-store`。
 
@@ -149,14 +149,21 @@ bablo auth reset-password --email user@example.com
 
 模型/Provider/价格写操作均要求 Web Session、CSRF、admin RBAC 和生产 MFA；发现是信号，管理员批准/映射才会产生可路由的 provider model。价格金额使用 decimal string，`unit_price` 表示主货币单位/一个维度单位，缺少 input/output 或 request 必需维度时解析失败，不按 0 收费；可选 cache/reasoning 维度缺专属价格时使用基础 input/output 价格。
 
-## 4. 支付面（按 Provider 启用）
+## 4. 支付面（P0 内核与 Stripe adapter 已实现，真实商户 E2E 未放行）
 
-- `POST /api/v1/me/payment-orders`：创建订单并返回待支付信息；
-- `GET /api/v1/me/payment-orders`、`GET .../{order_no}`：查询状态；
-- `POST /webhooks/{provider}`：仅接收 provider webhook，验签/订单号/金额/币种/状态/时间窗后入库；
-- `POST /api/v1/admin/payment-orders/{order_no}/refund`：权限、原订单状态和 provider 结果校验。
+- `POST /api/v1/me/payment-orders`：Web Session + CSRF；要求 `Idempotency-Key`，请求包含正整数 `amount_minor`、三字母 currency 和 `payment_provider`。`stripe` 只返回 allowlist 后的 Checkout redirect URL，不返回 secret/client secret；
+- `GET /api/v1/me/payment-orders`、`GET /api/v1/me/payment-orders/{order_no}`：只查询当前用户订单，使用 opaque cursor；响应包含订单状态和必要 Provider 引用，不暴露 webhook body 或密钥；
+- `POST /api/v1/me/payment-vouchers/redeem`：兑换一次性券码；数据库保存 hash/prefix 与短期可重放密文，成功兑换后清除密文；充值与券码消费在同一事务；
+- `POST /api/v1/admin/wallet-credits`：管理员人工充值；要求 MFA/RBAC/CSRF 与 `Idempotency-Key`，幂等事实绑定 operator、目标用户、币种和金额，跨 HTTP request ID 重试返回同一 ledger；
+- `POST /api/v1/admin/payment-vouchers`、`POST /api/v1/admin/payment-vouchers/{id}/revoke`：创建时一次性返回明文券码；相同幂等请求在未兑换前可安全重放原码，兑换后密文被清除；
+- `POST /api/v1/admin/payment-orders/{order_no}/refund`：先把用户可用余额原子移入 reserved，再以稳定 Provider idempotency key 发起退款；只有验签退款成功事件消费 reserved，确定失败事件释放，未知结果保持 `refund_pending` 并由维护 worker 对账；
+- `POST /api/v1/admin/payment-orders/{order_no}/close`：先关闭 Provider 订单，再更新本地终态；Provider 调用和本地提交之间由持久 operation lease 恢复；
+- `POST /webhooks/stripe`：在持久化前验证原始 body 的 `Stripe-Signature`、timestamp tolerance、锁定 API version、Connect account/merchant 和 live/test mode；处理 Checkout paid/failed/expired、refund created/updated/failed 以及 charge dispute created/closed；
+- Stripe 外部退款或争议可仅携带 PaymentIntent/Charge。Adapter 通过 Provider API 恢复 Bablo order reference 后，服务端要求 order/trade/refund/payment-intent/charge 的所有已知标识一致；外部退款和 dispute lost 通过 wallet liability 回收余额，不足时设置 financial hold；dispute won 追加反向 ledger；
+- 无效签名、过大 body 和超出并发槽位的 webhook 不写数据库；签名有效但订单错配/非法状态的事件保存为 rejected 审计事实并返回 Provider 不重试响应，数据库/暂态失败返回 5xx；
+- `POST /webhooks/fixture_hmac`：仅显式 opt-in 的非生产本地/集成测试；production 配置拒绝启用。
 
-客户端“支付成功”页面永远不写充值账本。未配置并验证真实 Provider 时，订单 API 可保持 disabled 或仅供 fixture/sandbox，不能宣称充值生产可用。
+Stripe Checkout/Refund 请求使用 Bablo order number 派生的稳定 Provider idempotency key，并固定 merchant/live mode。客户端 success URL 永远不写充值账本。`stripe-go/v86 v86.2.0` 已接入，但在真实 Stripe test mode 完成 create -> webhook -> wallet credit -> refund/external refund/dispute -> webhook -> liability/recovery E2E 前，self-service Stripe 支付仍为 NO-GO。
 
 ## 5. 通用错误与分页
 

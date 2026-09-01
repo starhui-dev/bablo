@@ -39,9 +39,9 @@ github.com/router-for-me/CLIProxyAPI/v7 v7.2.145
 - [ADR：模型路由与 Scheduler](docs/adr/0004-model-routing-and-scheduler.md)
 - [ADR：Web Session 认证](docs/adr/0005-web-session-authentication.md)
 
-项目按 `docs/implementation-status.md` 中的阶段顺序推进。plan、bootstrap、CPA adapter、data layer、Web Session auth、API Key 与模型目录已完成；后续依次实现 Credential、路由、调度、推理数据面、Usage/账务，再完成可观测性、安全、测试、压测、部署、CI 和上线门禁。
+项目按 `docs/implementation-status.md` 中的阶段顺序推进。plan、bootstrap、CPA adapter、data/auth/API Key、模型与 Credential 目录、路由、调度、推理 Proxy、Usage、Billing 和 Payment 内核已完成；Stripe Checkout/webhook/refund adapter 已精确锁定并通过本地契约/数据库测试，但真实 Stripe test-mode E2E 尚未执行，不能视为生产支付已放行。
 
-下一阶段：`/bablo-credentials`。
+下一阶段：`/bablo-quota`。
 
 ## 安全与上线
 

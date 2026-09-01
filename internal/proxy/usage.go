@@ -41,12 +41,13 @@ type requestUsageState struct {
 }
 
 type usageCompletion struct {
-	err        error
-	cancelled  bool
-	observed   usage.TokenUsage
-	usageFound bool
-	latency    time.Duration
-	ttft       *time.Duration
+	err            error
+	cancelled      bool
+	observed       usage.TokenUsage
+	usageFound     bool
+	latency        time.Duration
+	ttft           *time.Duration
+	upstreamStatus int
 }
 
 func (h *Handler) beginUsage(ctx context.Context, r *http.Request, principal apikey.Principal, endpoint endpoint, parsed parsedRequest) (*requestUsageState, error) {
@@ -160,7 +161,11 @@ func (s *requestUsageState) finalize(ctx context.Context, completion usageComple
 		provenance = usage.ProvenanceMissingUsage
 	}
 	var upstreamStatus *int
-	if completion.err != nil {
+	if completion.upstreamStatus >= 100 && completion.upstreamStatus <= 599 {
+		value := completion.upstreamStatus
+		upstreamStatus = &value
+	}
+	if upstreamStatus == nil && completion.err != nil {
 		var upstream *inference.UpstreamError
 		if errors.As(completion.err, &upstream) && upstream != nil && upstream.HTTPStatus >= 100 && upstream.HTTPStatus <= 599 {
 			value := upstream.HTTPStatus

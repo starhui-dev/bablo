@@ -58,7 +58,7 @@ P0 是“可控用户、预充值/管理员授信、单实例”的生产版本�
 9. CPA v7.2.145 adapter 的非流式、流式、取消和错误映射兼容测试；
 10. `/v1/models`、Chat Completions、Responses，包含 stream/non-stream、首包前/后错误和客户端取消；
 11. 自有 immutable UsageEvent、价格快照、预算预检/预留、Wallet Ledger、结算和失败重试；
-12. 管理员 grant/adjustment 或已验证的兑换码作为 P0 资金入口。支付 Provider 代码可在 P0 建立边界，但没有官方 sandbox/真实端到端证据时不得标为生产可用；
+12. 管理员 credit/adjustment 与一次性 voucher 已实现为 P0 资金入口；Stripe Checkout/webhook/refund adapter 已建立，但没有真实 test-mode E2E 证据时 self-service Stripe 支付不得标为生产可用；
 13. 基于 PostgreSQL 的基础统计、审计日志、敏感字段过滤；
 14. Docker/Compose 示例、migration release step、备份恢复和回滚 runbook。
 

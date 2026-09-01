@@ -485,7 +485,7 @@ func (h *Handler) executeJSON(w http.ResponseWriter, r *http.Request, _ apikey.P
 		} else {
 			err = errMalformedResponse
 		}
-		finalizeErr := finalizeUsage(r, usageState, usageCompletion{err: err, observed: observedUsage, usageFound: usageFound})
+		finalizeErr := finalizeUsage(r, usageState, usageCompletion{err: err, observed: observedUsage, usageFound: usageFound, upstreamStatus: status})
 		h.reportResult(r.Context(), selection, err)
 		if finalizeErr != nil {
 			writeProxyError(w, r, finalizeErr)
@@ -494,7 +494,7 @@ func (h *Handler) executeJSON(w http.ResponseWriter, r *http.Request, _ apikey.P
 		writeProxyError(w, r, err)
 		return
 	}
-	finalizeErr := finalizeUsage(r, usageState, usageCompletion{observed: observedUsage, usageFound: usageFound})
+	finalizeErr := finalizeUsage(r, usageState, usageCompletion{observed: observedUsage, usageFound: usageFound, upstreamStatus: status})
 	h.reportResult(r.Context(), selection, nil)
 	if finalizeErr != nil {
 		writeProxyError(w, r, finalizeErr)
@@ -520,12 +520,17 @@ func (h *Handler) executeStream(w http.ResponseWriter, r *http.Request, e endpoi
 		return
 	}
 	outcome := h.writeStream(w, r, e, stream)
+	upstreamStatus := 0
+	if outcome.wroteHeaders {
+		upstreamStatus = http.StatusOK
+	}
 	finalizeErr := finalizeUsage(r, usageState, usageCompletion{
-		err:        outcome.err,
-		cancelled:  outcome.cancelled,
-		observed:   outcome.observed,
-		usageFound: outcome.usageFound,
-		ttft:       outcome.ttft,
+		err:            outcome.err,
+		cancelled:      outcome.cancelled,
+		observed:       outcome.observed,
+		usageFound:     outcome.usageFound,
+		ttft:           outcome.ttft,
+		upstreamStatus: upstreamStatus,
 	})
 	if outcome.cancelled {
 		if finalizeErr != nil {
