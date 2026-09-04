@@ -2,7 +2,7 @@
 
 - 状态：Accepted（P0 Billing 与 Payment 内核已实现）
 - 日期：2026-08-29
-- 实现更新：2026-09-01
+- 实现更新：2026-09-04
 - 决策者：Bablo 技术负责人
 
 ## 背景
@@ -33,6 +33,7 @@ CPA 的 usage aggregation/queue 是异步、进程内的观测机制，不提供
 - `migrations/000016_payment_financial_recovery.sql`：pending settlement 恢复租约、wallet financial hold、`wallet_liabilities` 和不可变人工充值操作；
 - `migrations/000017_payment_provider_recovery.sql`：PaymentIntent/Charge/Dispute 标识、外部退款事实、争议状态机及跨表账务约束；
 - `migrations/000018_billing_liability_integrity.sql`：Provider financial reference 的 liability 全局唯一约束；
+- `migrations/000019_quota_observation.sql`：quota snapshot 的 provider/model/observation key、metadata、幂等唯一约束、append-only guard 和可重建 probe state；quota 只提供资源观测，不参与 Usage/Ledger 事实计算。
 - `internal/billing`：精确 Quote、Reserve、Settle、Release、Credit、payment refund hold/consume/release、liability open/recover/reverse、pending settlement recovery、GetWallet 与 RebuildBalance；
 - `internal/payment`：Provider-neutral order/refund state machine、Stripe Checkout/webhook/refund/外部退款/争议 adapter、merchant/live-mode 绑定、fixture test provider、voucher/admin credit、operation/expiration/reconciliation worker；
 - `internal/proxy`：强制配置 Billing coordinator，解析最大输出 token，先 reserve 再调用 CPA，UsageEvent 后 settle；

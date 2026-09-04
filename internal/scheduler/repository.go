@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,7 +30,7 @@ func NewRepository(store *data.Store) (*Repository, error) {
 	return &Repository{store: store}, nil
 }
 
-func (r *Repository) loadPoolMembers(ctx context.Context, poolID uuid.UUID, quota QuotaPolicy) ([]poolMember, error) {
+func (r *Repository) loadPoolMembers(ctx context.Context, poolID uuid.UUID, quota QuotaPolicy, upstreamModel string) ([]poolMember, error) {
 	rows, err := r.store.Queryer().Query(ctx, `
 		SELECT pm.credential_id, pm.priority, pm.weight, pm.enabled,
 			c.status, c.max_concurrency, c.region, c.proxy_ref,
@@ -42,12 +43,16 @@ func (r *Repository) loadPoolMembers(ctx context.Context, poolID uuid.UUID, quot
 		LEFT JOIN LATERAL (
 			SELECT qs.remaining_tokens, qs.reset_at, qs.observed_at, qs.confidence
 			FROM quota_snapshots qs
-			WHERE $2 <> '' AND qs.credential_id = c.id AND qs.window_kind = $2
-			ORDER BY qs.observed_at DESC, qs.id DESC
+			WHERE $2 <> ''
+			  AND qs.credential_id = c.id
+			  AND qs.provider_slug = p.slug
+			  AND qs.window_kind = $2
+			  AND (qs.model = '' OR qs.model = $3)
+			ORDER BY (qs.model = $3) DESC, qs.observed_at DESC, qs.id DESC
 			LIMIT 1
 		) quota ON true
 		WHERE pm.pool_id = $1
-		ORDER BY pm.priority, pm.credential_id`, poolID, quota.WindowKind)
+		ORDER BY pm.priority, pm.credential_id`, poolID, quota.WindowKind, strings.TrimSpace(upstreamModel))
 	if err != nil {
 		return nil, fmt.Errorf("load scheduler pool members: %w", err)
 	}

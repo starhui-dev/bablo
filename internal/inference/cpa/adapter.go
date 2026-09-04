@@ -21,7 +21,7 @@ import (
 	"github.com/starhui-dev/bablo/internal/inference"
 )
 
-const sdkVersion = "v7.2.145"
+const sdkVersion = "v7.2.149"
 
 // Options configures a manager-backed adapter without exposing CPA types.
 type Options struct {

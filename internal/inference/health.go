@@ -7,8 +7,12 @@ import "time"
 // local cooldown behavior.
 type CredentialResult struct {
 	CredentialID  string
+	Provider      string
+	Model         string
+	RouteModel    string
 	Succeeded     bool
 	ErrorClass    string
+	HTTPStatus    int
 	CooldownUntil *time.Time
 	ObservedAt    time.Time
 }

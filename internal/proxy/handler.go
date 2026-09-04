@@ -240,6 +240,16 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, e endpoint) {
 		usageState.setResolution(resolution)
 	}
 	required := requiredCapabilities(e, parsed)
+	quotaPolicy := h.quotaPolicy
+	if quotaPolicy.Enabled {
+		requiredTokens := estimateTokens(body)
+		if parsed.MaxOutputTokens > 0 {
+			requiredTokens += parsed.MaxOutputTokens
+		}
+		if requiredTokens > quotaPolicy.RequiredTokens {
+			quotaPolicy.RequiredTokens = requiredTokens
+		}
+	}
 	selection, err := h.scheduler.Select(r.Context(), scheduler.Request{
 		RequestID:            requestID(r),
 		RequestRecordID:      usageRecordID(usageState),
@@ -247,6 +257,7 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, e endpoint) {
 		Protocol:             e.protocol(),
 		RequiredCapabilities: required,
 		Strategy:             h.strategy,
+		Quota:                quotaPolicy,
 		AffinityKey:          principal.APIKeyID.String() + ":" + publicModel.PublicID,
 		Now:                  h.now().UTC(),
 	})
@@ -479,6 +490,7 @@ func (h *Handler) executeJSON(w http.ResponseWriter, r *http.Request, _ apikey.P
 		status = http.StatusOK
 	}
 	observedUsage, usageFound := usage.ExtractJSON(result.Body)
+	h.observeQuota(r.Context(), selection, request, result.Headers, h.now().UTC())
 	if status < 200 || status >= 300 || len(bytes.TrimSpace(result.Body)) == 0 || !json.Valid(result.Body) {
 		if status < 200 || status >= 300 {
 			err = &inference.UpstreamError{Class: "upstream_response", HTTPStatus: status}
@@ -520,6 +532,7 @@ func (h *Handler) executeStream(w http.ResponseWriter, r *http.Request, e endpoi
 		return
 	}
 	outcome := h.writeStream(w, r, e, stream)
+	h.observeQuota(r.Context(), selection, request, outcome.headers, h.now().UTC())
 	upstreamStatus := 0
 	if outcome.wroteHeaders {
 		upstreamStatus = http.StatusOK
@@ -567,6 +580,7 @@ type streamOutcome struct {
 	err          error
 	cancelled    bool
 	wroteHeaders bool
+	headers      map[string][]string
 	observed     usage.TokenUsage
 	usageFound   bool
 	ttft         *time.Duration
@@ -576,6 +590,7 @@ func (h *Handler) writeStream(w http.ResponseWriter, r *http.Request, e endpoint
 	streamStarted := time.Now()
 	var accumulator usage.Accumulator
 	var firstPayloadAt time.Time
+	var responseHeaders map[string][]string
 	defer func() {
 		outcome.observed, outcome.usageFound = accumulator.Value()
 		if !firstPayloadAt.IsZero() {
@@ -585,10 +600,12 @@ func (h *Handler) writeStream(w http.ResponseWriter, r *http.Request, e endpoint
 			}
 			outcome.ttft = &ttft
 		}
+		outcome.headers = cloneObservedHeaders(responseHeaders)
 	}()
 	if stream == nil {
 		return streamOutcome{err: errEmptyStream}
 	}
+	responseHeaders = stream.Headers()
 	defer stream.Close()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -607,7 +624,7 @@ func (h *Handler) writeStream(w http.ResponseWriter, r *http.Request, e endpoint
 				firstPayloadAt = time.Now()
 			}
 			if !wroteHeaders {
-				writeSafeResponseHeaders(w, stream.Headers())
+				writeSafeResponseHeaders(w, responseHeaders)
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.Header().Set("Cache-Control", "no-store")
 				w.Header().Set("Connection", "keep-alive")
@@ -710,14 +727,18 @@ func (h *Handler) reportResult(ctx context.Context, selection scheduler.Selectio
 	observedAt := h.now().UTC()
 	result := inference.CredentialResult{
 		CredentialID: selection.CredentialID.String(),
+		Provider:     strings.TrimSpace(selection.Target.ProviderSlug),
+		Model:        strings.TrimSpace(selection.Target.UpstreamModelID),
+		RouteModel:   strings.TrimSpace(selection.Target.UpstreamModelID),
 		Succeeded:    err == nil,
 		ObservedAt:   observedAt,
 	}
 	if err != nil {
 		result.ErrorClass = errorClass(err)
-		if status := errorStatus(err); status == http.StatusTooManyRequests || status >= 500 {
+		result.HTTPStatus = errorStatus(err)
+		if result.HTTPStatus == http.StatusTooManyRequests || result.HTTPStatus >= 500 {
 			cooldown := observedAt.Add(30 * time.Second)
-			if status == http.StatusTooManyRequests {
+			if result.HTTPStatus == http.StatusTooManyRequests {
 				cooldown = observedAt.Add(time.Minute)
 			}
 			result.CooldownUntil = &cooldown

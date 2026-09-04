@@ -1,19 +1,19 @@
 # Bablo 实施状态
 
-> 最后更新：2026-08-31
-> 本次工作：完成 `bablo-billing` 的精确计价、已发布价格绑定、Wallet reservation/settlement、available/reserved ledger、API Key budget 门禁、pending retry、余额重建与 Proxy 端到端接线；下一阶段进入 `bablo-payment`。
+> 最后更新：2026-09-04
+> 本次工作：完成 `bablo-quota` 的 provider quota/health 观测层、PostgreSQL immutable snapshot、Redis TTL credential lease、退避与 staleness、Scheduler 可选 freshness 输入、管理员 quota 查询 API 和请求路径被动响应头接线；修正 Scheduler 集成 fixture 未按 resolved provider/model 写入快照的问题；下一阶段进入 `bablo-stats`。
 
 ## 1. 仓库审计结果
 
 | 项目 | 观察结果 | 证据/影响 |
 |---|---|---|
 | 根目录 | `.omp/`、`docs/`、Go/Vue bootstrap 文件 | 保留既有提示词与规划文档，新增实现文件 |
-| 后端 | 已建立 Go bootstrap、CPA adapter、data layer、`internal/auth`、`internal/apikey`、`internal/model`、`internal/provider`、`internal/pricing`、`internal/credential`、`internal/route`、`internal/scheduler`、`internal/proxy`、`internal/usage`、`internal/billing` 与共享 `internal/audit`；`cmd/bablo` 已接线用户模型目录、管理员 catalog、Credential、Route、Scheduler、CPA runtime reconcile、Usage 和 Wallet Billing 数据面 | Web Session 只保护管理面；admin catalog 强制 RBAC/MFA/CSRF；CPA 仍只在 adapter 边界 import |
-| 前端 | Vue 登录页已接通 Session/MFA 登录、CSRF header、路由守卫和退出；模型/Key/Credential/Wallet 管理 UI 留到后续前端阶段 | 当前目录 HTTP API 已可供后续 UI 使用，Dashboard/404 仍为业务壳 |
-| 数据库 | 已落地 `000001`–`000011` migrations；`000011_billing_integrity.sql` 增加 reservation/settlement、显式 available/reserved ledger delta、跨表 owner/request/price/Usage guard 和 ledger immutable trigger | `cmd/bablo-migrate` 显式执行 up/down；应用启动不自动改 schema；空 schema up、latest down、重放和真实 Billing transaction 已验证 |
+| 后端 | 已建立 Go bootstrap、CPA adapter、data layer、`internal/auth`、`internal/apikey`、`internal/model`、`internal/provider`、`internal/pricing`、`internal/credential`、`internal/route`、`internal/scheduler`、`internal/proxy`、`internal/usage`、`internal/billing`、`internal/payment`、`internal/quota` 与共享 `internal/audit`；`cmd/bablo` 已接线用户模型目录、管理员 catalog/Credential/quota、Route、Scheduler、CPA runtime reconcile、Usage、Wallet Billing 和 Payment 数据面 | Web Session 只保护管理面；admin catalog 强制 RBAC/MFA/CSRF；CPA 仍只在 adapter 边界 import |
+| 前端 | Vue 登录页已接通 Session/MFA 登录、CSRF header、路由守卫和退出；模型/Key/Credential/Quota/Wallet 管理 UI 留到后续前端阶段 | 当前目录 HTTP API 已可供后续 UI 使用，Dashboard/404 仍为业务壳 |
+| 数据库 | 已落地 `000001`–`000019` migrations；`000019_quota_observation.sql` 增加 quota snapshot provider/model/observation key/metadata、幂等唯一约束、append-only trigger 和 rebuildable probe state | `cmd/bablo-migrate` 显式执行 up/down；应用启动不自动改 schema；quota 空 schema up、latest down、重放和 PostgreSQL transaction 测试已验证 |
 | 文档 | 架构规划、ADR、README、LICENSE、CPA compatibility 证据均已存在 | API/data/security/architecture/status 已同步 Billing 实际契约与后置 HTTP surface |
 | Git | 当前工作目录未检测到 `.git` 元数据，不能独立报告分支/未提交 diff | 未执行破坏性覆盖；保留既有文件并增量落盘 |
-| CPA 本地使用 | `go.mod` 精确 pin `v7.2.145`；adapter Build/Run/Shutdown、Manager Execute/Stream 和 Credential runtime 注册已接线 | 真实 Provider/OAuth E2E 仍缺外部凭据 |
+| CPA 本地使用 | `go.mod` 精确 pin `v7.2.149`；adapter Build/Run/Shutdown、Manager Execute/Stream、Credential runtime 注册和 quota/health response observation 已接线 | 真实 Provider/OAuth E2E 仍缺外部凭据 |
 
 ## 2. 已落盘的规划
 
@@ -29,8 +29,8 @@
 ## 3. 已确定的硬决策
 
 1. 产品语义固定为 Bablo，CPA 不成为公共产品名；
-2. 只有 `internal/inference/cpa` import CPA；已精确 pin `github.com/router-for-me/CLIProxyAPI/v7 v7.2.145`；
-3. CPA module major 为 v7，tag `go 1.26.0`；main 不作为生产依赖；
+2. 只有 `internal/inference/cpa` import CPA；已精确 pin `github.com/router-for-me/CLIProxyAPI/v7 v7.2.149`；
+3. CPA module major 为 v7，tag `go 1.26.0`；main 当前与 tag 相同但不作为未审计浮动依赖；
 4. API Key -> policy/entitlement -> model route，一个 Key 可访问多个模型；
 5. PostgreSQL 是业务唯一事实源，Redis 只存可重建运行时状态；
 6. UsageEvent + Wallet Ledger 是唯一计费事实；CPA usage queue 不入账；
@@ -43,7 +43,7 @@
 
 ## 4. 上游 CPA 核验摘要
 
-观察日期 2026-08-29：官方稳定 release `v7.2.145`，tag commit `d9cea8904b14fbbebb77ef26e98ef08f6b48a724`；module `github.com/router-for-me/CLIProxyAPI/v7`，要求 `go 1.26.0`。Bablo 已精确 pin 该版本并生成 `go.sum`，本机 Go 1.27.0 完成 compile/test/race/vet/build。adapter 只 import public `sdk/auth`、`sdk/config`、`sdk/cliproxy`、`sdk/cliproxy/auth`、`sdk/cliproxy/executor`、`sdk/translator`。上游 `docs/sdk-usage.md` 的 v6/internal/config/option/stream 漂移仍成立，详见 `docs/upstream-compatibility.md`。
+观察日期 2026-09-04：官方稳定 release `v7.2.149`，tag/main commit `2a6b87aca083a5bf498ac1f68a1b636c500d7aaa`，发布于 2026-09-03 13:30:35Z；module `github.com/router-for-me/CLIProxyAPI/v7`，要求 `go 1.26.0`。Bablo 已精确 pin 该版本并完成本地 compile/test/race/vet/build；adapter 只 import public `sdk/auth`、`sdk/config`、`sdk/cliproxy`、`sdk/cliproxy/auth`、`sdk/cliproxy/executor`、`sdk/translator`。v7.2.149 的 `sdk/cliproxy/auth/quota_signals.go` 明确只支持 Claude/Codex 被动 quota signals；上游 `docs/sdk-usage.md` 仍保留 v6/internal/config/option/stream 漂移，详见 `docs/upstream-compatibility.md`。
 
 ## 5. 完整实施顺序与阶段验收
 
@@ -65,8 +65,8 @@
 | 12 | `bablo-usage` | proxy execution facts | 完成：immutable UsageEvent、settlement key、stream cancel/no-usage/reconcile/outbox 测试 |
 | 13 | `bablo-billing` | 完成 | exact decimal quote、published price、reservation/charge/release、daily/monthly budget、pending retry、ledger rebuild/immutable、并发与重复 settle 均有 PostgreSQL 测试 |
 | 14 | `bablo-payment` | payment business decision + provider docs | order state machine、验签 fixture、金额/币种/防重放/幂等；无真实凭据则 NO-GO |
-| 15 | `bablo-quota` | provider-specific legal probe | snapshot observed_at/stale/confidence、backoff、单 credential 防并发；不猜接口 |
-| 16 | `bablo-stats` | usage/ledger | 维度筛选、趋势/排行/trace；rollup 与 raw/ledger 对账 |
+| 15 | `bablo-quota` | provider-specific legal probe | 已完成：Claude/Codex CPA public response-header observation、immutable snapshot/state、staleness、指数退避+jitter、429/401/403/5xx health feedback、Redis TTL lease、admin quota view；Gemini/Grok/未知 Provider 不猜测接口 |
+| 16 | `bablo-stats` | Usage/Ledger/outbox | 运营概览、趋势、受控维度日/小时 rollup、raw 对账、Usage trace、Scheduler/支付统计；不得自建计费公式 |
 | 17 | `bablo-admin` | 管理 API | 管理用户/资源/route/price/ledger/audit；危险操作确认和权限复核 |
 | 18 | `bablo-user` | 用户 API | Overview、Key、多模型、Usage、Wallet/Billing、空/错/移动端状态和 E2E |
 | 19 | `bablo-observability` | 主要请求路径 | JSON logs、metrics、health、告警/runbook；无敏感正文和高基数 labels |
@@ -97,10 +97,10 @@
 ## 7. 下一阶段
 
 ```text
-/bablo-quota
+/bablo-stats
 ```
 
-Payment 内核、Stripe adapter、外部退款/争议追偿和 settlement/liability recovery 已完成；下一步实现真实 quota snapshot 采集与保守 freshness policy。没有合法 Provider probe 凭据时完成接口、存储和 fake integration，但保持真实 quota-aware 能力 NO-GO。
+Quota 阶段已完成。当前 Scheduler quota policy 默认关闭；只有在 staging 观察到合法且足够稳定的 Provider signal 后，才通过配置启用 freshness/exhaustion 过滤。没有真实 Provider/OAuth 凭据时，quota-aware 生产能力仍保持 NO-GO。
 
 ## 8. Bootstrap 验收与验证证据
 
@@ -114,7 +114,7 @@ Payment 内核、Stripe adapter、外部退款/争议追偿和 settlement/liabil
 
 ## 9. CPA Adapter 验收与验证证据
 
-- `go.mod` 精确 pin `github.com/router-for-me/CLIProxyAPI/v7 v7.2.145`，`go.sum` 含 module/content checksum；
+- `go.mod` 精确 pin `github.com/router-for-me/CLIProxyAPI/v7 v7.2.149`，`go.sum` 含 module/content checksum；
 - `internal/inference` 定义 Bablo Request/ResolvedRoute/ExecutionResult/Stream/Capabilities/UpstreamError，不向业务层暴露 CPA 类型；
 - `internal/inference/cpa` 实现 config load、Builder/Service lifecycle、Manager execute/stream、source/response format、request ID、provider/pinned credential、safe error 和 stream headers/cancel 映射；
 - fake provider 覆盖 non-stream、stream、401/429/5xx、caller cancel、stream close、request ID、credential pin、capability copy、service build/shutdown；
@@ -126,10 +126,10 @@ Payment 内核、Stripe adapter、外部退款/争议追偿和 settlement/liabil
 - `go.mod` 精确 pin `github.com/jackc/pgx/v5 v5.10.0` 与 `github.com/pressly/goose/v3 v3.27.3`；Goose v3.27.3 要求 Go 1.25.7，当前项目/CPA Go 基线为 1.26.0，实际环境 Go 1.27.0。
 - `migrations/000001_initial_schema.sql` 覆盖 users/roles/sessions/MFA/API keys/policy/models/providers/credentials/pools/routes/quota/prices/requests/usage/wallet/payment/audit/outbox/stats；所有主键由应用 UUIDv7 提供。
 - `migrations/000002_fact_table_guards.sql` 建立事实表 append-only trigger 和 provider/pool/route target 归属校验；PostgreSQL 错误码断言已纳入集成测试。
-- `migrations/000003_wallet_payment_integrity.sql` 至 `000011_billing_integrity.sql` 依次补充账务/支付、Web Session/MFA、API Key、模型目录/价格、Credential、Route、Scheduler、Usage 和 Billing；`000012_payment_integrity.sql` 至 `000018_billing_liability_integrity.sql` 增加 Payment 状态机/验签处理、Stripe event、Provider operation recovery、merchant/live-mode、financial hold/liability、external refund/dispute 和 liability reference 唯一约束；已应用迁移保持不可变。
+- `migrations/000003_wallet_payment_integrity.sql` 至 `000011_billing_integrity.sql` 依次补充账务/支付、Web Session/MFA、API Key、模型目录/价格、Credential、Route、Scheduler、Usage 和 Billing；`000012_payment_integrity.sql` 至 `000019_quota_observation.sql` 增加 Payment 状态机/验签处理、Stripe event、Provider operation recovery、merchant/live-mode、financial hold/liability、external refund/dispute、liability reference 唯一和 quota snapshot/state 约束；已应用迁移保持不可变。
 - `internal/data.Open` 解析 pgxpool、固定会话 timezone=UTC/application_name=bablo 并执行真实 Ping；`Store.WithTx` 提供提交/回滚边界。
 - `cmd/bablo-migrate` 与 Makefile `migrate`/`migrate-down` 可显式运行 schema 变更；应用启动不自动迁移。
-- 真实 PostgreSQL 已验证完整 `0 -> 18`、latest `18 -> 17 -> 18`；从 v14 含历史 Provider 事实升级到 v15 会以 SQLSTATE `55000` 明确阻塞并要求运营从权威 Provider 回填 merchant/live mode，而不是猜测；reservation/settlement/payment/liability 跨表约束、ledger immutable 和余额重建均有测试。
+- 真实 PostgreSQL 已验证完整 `0 -> 19`、latest `19 -> 18 -> 19`；从 v14 含历史 Provider 事实升级到 v15 会以 SQLSTATE `55000` 明确阻塞并要求运营从权威 Provider 回填 merchant/live mode，而不是猜测；reservation/settlement/payment/liability/quota 跨表约束、ledger immutable 和余额重建均有测试。
 
 ## 11. Auth 验收与验证证据
 
@@ -174,7 +174,7 @@ Payment 内核、Stripe adapter、外部退款/争议追偿和 settlement/liabil
 - secret create/rotate/reencrypt 均在服务层校验 source-kind、大小、重复 kind 和 metadata；历史 secret 通过数据库 trigger append-only 保护；撤销 Credential 不可重新激活；并发 rotate 在 Credential 行锁下分配连续 version，并使用 wall-clock rotation timestamp 满足时间约束。
 - `credential_health` 只接受不早于已观测时间的 snapshot；状态写入记录 last success/error/cooldown；pool membership 由数据库 trigger 强制 Credential 与 Pool 属于同一 Provider；管理员 API 不回显 secret，响应 `Cache-Control: no-store`。
 - 管理 API 已接线：`GET/POST /api/v1/admin/credentials`、`GET/PATCH /api/v1/admin/credentials/{id}`、`POST .../rotate|reencrypt`、`GET .../health`、`GET/POST /api/v1/admin/credential-pools`、`POST/DELETE .../members`；统一通过 admin RBAC/MFA/CSRF 保护，写入 sanitized audit。
-- CPA runtime bridge 使用锁定 `v7.2.145` 的公开 `sdk/cliproxy/auth`，映射为 `runtime_only=true` 的 CPA auth；PostgreSQL 仍是事实源，CPA runtime store 不回写业务 secret；Remove 只清理运行时状态。
+- CPA runtime bridge 使用锁定 `v7.2.149` 的公开 `sdk/cliproxy/auth`，映射为 `runtime_only=true` 的 CPA auth；PostgreSQL 仍是事实源，CPA runtime store 不回写业务 secret；Remove 只清理运行时状态。
 - 真实 PostgreSQL 17-alpine 集成测试覆盖 secret ciphertext/非泄漏、AAD/key rotation、secret rotate/reencrypt、health monotonicity、Provider pool 归属、复合游标分页和 12 路并发 rotate；HTTP 端到端覆盖管理员 create/health 与统一路由挂载；CPA 单测覆盖 OAuth/API key runtime mapping 和 unsupported source 清理。
 - 验证命令及结果：`BABLO_TEST_DATABASE_URL=... go test -count=1 ./...` 通过（13 packages、4 no-test packages）；`go test -race -count=1 ./internal/credential ./internal/inference/cpa ./internal/config ./internal/httpapi ./cmd/bablo` 通过；`go vet ./...`、`go build -trimpath -o /tmp/bablo-credential-final ./cmd/bablo`、`docker compose --env-file .env.example -f deploy/compose.dev.yaml config --quiet` 通过；前端 `pnpm --dir web lint/typecheck/test/build` 通过。
 - 当前限制：真实 OAuth refresh/provider executor E2E、Credential 变更后的运行时热同步、CPA refresh token 回写 PostgreSQL、管理员 Credential UI、Redis/HA keyring reload 尚未实现或验证；启动时从 PostgreSQL reconcile 到 CPA Manager 已由 `cmd/bablo` 接线，但不能替代变更事件同步；这些仍阻塞整体生产 GO。
@@ -192,9 +192,8 @@ Payment 内核、Stripe adapter、外部退款/争议追偿和 settlement/liabil
 - `internal/scheduler` 接收固定的 `route.Resolution`，先过滤 target/member 的 disabled/revoked、Provider/resource commercial policy、协议/能力、cooldown、地区/代理和 quota freshness/reset，再按 priority 与显式策略排序；不接触 Credential secret，也不 import CPA。
 - 默认 `round_robin` 使用 PostgreSQL route version + strategy + priority 的稳定 cursor；同时提供显式 `weighted_round_robin`、`fill_first`、`quota_aware` 和有限 affinity。没有隐式随机；affinity 不能绕过硬过滤，失效会写 `affinity_unavailable`。
 - Redis 协调器使用 `SET NX PX` owner-token lease、Lua 原子 release/renew/cursor、TTL affinity；内存实现只用于 P0 单实例和测试。Redis 错误不会被当成可用容量，避免并发超卖。
-- 每次成功/失败选择都写 immutable `scheduler_decisions`，保存候选、排除原因、selected target/provider/credential、fallback chain 和 strategy version；`000009_scheduler_integrity.sql` 以数据库约束和 trigger 校验选择归属。
-- 验证命令及结果：`go test -count=1 ./...`（无外部测试环境）通过；本次使用本机 PostgreSQL/Redis 测试实例执行 `go test -p 1 -race ./... -count=1`，16 packages 通过；`go vet ./...`、`go build -trimpath -o /tmp/bablo-proxy-verify ./cmd/bablo`、迁移二进制构建和前端 lint/typecheck/test/build 通过。并行运行带共享 PostgreSQL 的全套集成测试曾因连接/迁移锁竞争触发 Route 测试 30 秒 context deadline，串行 `-p 1` 通过，CI 应显式控制数据库连接容量或测试并发。
-- 当前限制：quota poller、真实 Provider health/429 feedback 和管理员 Decision 查询 API 仍未完成；Proxy、Usage 与 Billing 已接通，Scheduler 的 provider quota-aware 能力仍需真实合法 probe 数据。
+- 验证命令及结果：`go test -count=1 ./...`（无外部测试环境）通过；本次使用本机 PostgreSQL/Redis 测试实例执行 `go test -p 1 -race ./... -count=1`，16 packages 通过；`go vet ./...`、`go build -trimpath -o /tmp/bablo-proxy-verify ./cmd/bablo`、迁移二进制构建和前端 lint/typecheck/build 通过。并行运行带共享 PostgreSQL 的全套集成测试曾因连接/迁移锁竞争触发 Route 测试 30 秒 context deadline，串行 `-p 1` 通过，CI 应显式控制数据库连接容量或测试并发。
+- 当前限制：真实 Provider health/429 feedback 和管理员 Decision 查询 API 已由 quota 阶段提供本地观测与查询；真实 Provider/OAuth E2E、stats/告警消费者仍待后续阶段。Proxy、Usage、Billing 与 Scheduler quota 输入已接通。
 
 ## 17. Proxy 验收与验证证据
 
@@ -238,11 +237,23 @@ Payment 内核、Stripe adapter、外部退款/争议追偿和 settlement/liabil
 - Bablo 发起退款先将 available 移入 reserved，成功 event 消费、确定失败 event 释放、未知结果保持 pending。Provider 控制台外部退款和 dispute lost 创建 liability 并回收余额，不足时保持 financial hold；dispute won 反转已回收 ledger；
 - 人工充值幂等事实绑定 operator/user/currency/amount；voucher 使用 hash + prefix + 版本化 AEAD，未兑换时同幂等请求可重放原码，兑换后清除密文；
 - 配置层生产拒绝 fixture、Stripe test key、HTTP/placeholder return URL；任何启用的支付能力都要求 PostgreSQL。实际启动 smoke 已验证：启用 Stripe 且缺 `BABLO_DATABASE_URL` 返回退出码 1；production 缺 `BABLO_REDIS_URL` 同样退出码 1。Webhook body 限制 256 KiB、读取期限 10 秒、进程内并发槽位 32；
-- migration 已验证 `0 -> 18`、`18 -> 17 -> 18` 与 v14 历史支付身份阻塞；最终 `go test -p 1 -count=1 ./...` 为 19 packages 通过、4 packages 无测试，并覆盖维护队列失败轮转与完整 resolved route/provider model/provider/credential/upstream status Usage 事实；race、vet、binary、前端和 Compose 验证结果见 Auth/Billing 章节；
+- migration 已验证 `0 -> 19`、`19 -> 18 -> 19` 与 v14 历史支付身份阻塞；最终 `BABLO_TEST_DATABASE_URL=... BABLO_TEST_REDIS_URL=... go test -p 1 -race -count=1 ./...` 为 20 个有测试包通过、4 个无测试包，并覆盖维护队列失败轮转、完整 resolved route/provider model/provider/credential/upstream status Usage 事实和 quota freshness/affinity failover；race、vet、binary、前端和 Compose 验证结果见各章节。
 - 当前 NO-GO：没有真实 Stripe account/API key/webhook secret/HTTPS domain，未执行官方 test-mode create -> paid webhook -> wallet -> Bablo refund/external refund/dispute -> liability/recovery E2E；没有该证据不得开放 self-service Stripe 支付。
 
-## 21. 下一阶段
+## 21. Quota 验收与验证证据
+
+- `internal/quota` 定义 `QuotaProbe`、`HealthProbe`、被动 `ResponseObserver`、标准化 Window/Observation/Snapshot/ProbeState；只保存 bounded metadata/watermark，默认不保存 Prompt、响应正文或 secret。
+- `migrations/000019_quota_observation.sql` 为历史 snapshot 回填 provider/model/observation key，新增 metadata、幂等唯一键、latest/due 索引、immutable snapshot trigger 和可重建 `quota_probe_states`；成功 observation 与 state transition 在同一 PostgreSQL transaction，重复同事实可重放，冲突 payload 拒绝。
+- `internal/inference/cpa` 仅调用锁定 CPA v7.2.149 的公开 `ProviderSupportsQuotaObservation` 和 `QuotaState.ObserveResponseHeadersForProvider`；当前真实可核验 signal 只覆盖 Claude/Codex。Proxy 传给 observer 前做 Bablo allowlist、canonicalization、长度/控制字符限制；observer 被动运行，不发额外上游请求。
+- Poll worker 从 PostgreSQL 解析 Credential/Provider，使用 Redis `SET NX PX` owner-token lease；无 Redis 只允许单实例/测试内存 fallback。Quota/health probe 总周期受 lease safety margin 约束，失败按 provider Retry-After、指数退避和确定性 jitter 更新 state，不刷新旧 snapshot 的 `observed_at`；401/403 使用长 auth backoff，429/5xx 写标准 error class 并反馈 Credential health。
+- Scheduler 在显式 `QuotaPolicy` 下按 requested token 和 selected window 检查 missing/stale/reset；`RequireFresh` 保守拒绝，未知 remaining 不被推导为可用。管理员 `GET /api/v1/admin/credentials/{id}/quota` 返回有界 state/snapshots/supported probes，不回显 secret。
+- 测试覆盖：header allowlist/敏感头剥离、metadata/window 边界、稳定 observation key、重复/冲突、probe lease 并发、父 context deadline、退避 cap、health cooldown、真实 PostgreSQL migration/repository 并发幂等、Scheduler missing/stale/exhausted 和 HTTP quota endpoint；先复现并修正 Scheduler 集成 fixture 未使用 resolved provider/model 的回归后，`go test -p 1 -race -count=3 ./internal/scheduler -run '^TestQuotaFreshnessAndAffinityFailover$'` 通过，随后带 PostgreSQL/Redis 的全仓库竞态测试通过。
+- 当前限制：没有真实合法 Provider OAuth/API key 和 provider-specific probe E2E；CPA public API 当前没有 Gemini/Grok quota observation，真实 quota-aware scheduling 与外部健康反馈保持 NO-GO。Quota snapshot retention/rollup 和 stats/告警消费者留给 `bablo-stats`/observability 阶段。
+
+## 22. 下一阶段
 
 ```text
-/bablo-quota
+/bablo-stats
 ```
+
+Stats 阶段应从 UsageEvent、Wallet Ledger、Scheduler Decision、PaymentEvent/订单事实派生受控维度的查询与小时/日 rollup，并提供 raw-to-rollup 对账、Usage trace 和管理员查询 API；不得引入第二套计费公式。

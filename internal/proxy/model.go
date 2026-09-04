@@ -17,6 +17,7 @@ import (
 	"github.com/starhui-dev/bablo/internal/inference"
 	catalogmodel "github.com/starhui-dev/bablo/internal/model"
 	"github.com/starhui-dev/bablo/internal/pricing"
+	"github.com/starhui-dev/bablo/internal/quota"
 	"github.com/starhui-dev/bablo/internal/route"
 	"github.com/starhui-dev/bablo/internal/scheduler"
 	"github.com/starhui-dev/bablo/internal/usage"
@@ -71,6 +72,12 @@ type RuntimeReporter interface {
 	MarkCredentialResult(context.Context, inference.CredentialResult)
 }
 
+// QuotaObserver persists provider quota signals observed from a completed
+// upstream response. It must remain passive and never issue another request.
+type QuotaObserver interface {
+	ObserveResponse(context.Context, quota.ProbeRequest, map[string][]string, time.Time) error
+}
+
 // UsageRecorder persists request and usage facts. It is optional during bootstrap
 // but should be configured for every production inference handler.
 type UsageRecorder interface {
@@ -101,7 +108,6 @@ var (
 	_ HealthReporter        = (*credential.Service)(nil)
 )
 
-// Options wires the Proxy orchestration boundary.
 type Options struct {
 	APIKeys         KeyAuthorizer
 	Models          ModelCatalog
@@ -110,6 +116,7 @@ type Options struct {
 	Engine          inference.Engine
 	HealthReporter  HealthReporter
 	RuntimeReporter RuntimeReporter
+	QuotaObserver   QuotaObserver
 	UsageRecorder   UsageRecorder
 	PriceResolver   PriceSnapshotResolver
 	Billing         BillingCoordinator
@@ -117,6 +124,7 @@ type Options struct {
 	MaxBodyBytes    int64
 	LeaseTTL        time.Duration
 	Strategy        scheduler.Strategy
+	QuotaPolicy     scheduler.QuotaPolicy
 	Now             func() time.Time
 }
 
@@ -128,6 +136,7 @@ type Handler struct {
 	engine       inference.Engine
 	health       HealthReporter
 	runtime      RuntimeReporter
+	quota        QuotaObserver
 	usage        UsageRecorder
 	prices       PriceSnapshotResolver
 	billing      BillingCoordinator
@@ -135,6 +144,7 @@ type Handler struct {
 	maxBodyBytes int64
 	leaseTTL     time.Duration
 	strategy     scheduler.Strategy
+	quotaPolicy  scheduler.QuotaPolicy
 	now          func() time.Time
 	principal    func(context.Context) (apikey.Principal, bool)
 }
@@ -187,6 +197,7 @@ func NewHandler(options Options) (http.Handler, error) {
 		engine:       options.Engine,
 		health:       options.HealthReporter,
 		runtime:      options.RuntimeReporter,
+		quota:        options.QuotaObserver,
 		usage:        options.UsageRecorder,
 		prices:       options.PriceResolver,
 		billing:      options.Billing,
@@ -194,6 +205,7 @@ func NewHandler(options Options) (http.Handler, error) {
 		maxBodyBytes: options.MaxBodyBytes,
 		leaseTTL:     options.LeaseTTL,
 		strategy:     options.Strategy,
+		quotaPolicy:  options.QuotaPolicy,
 		now:          options.Now,
 		principal:    apikey.PrincipalFromContext,
 	}

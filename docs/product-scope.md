@@ -55,7 +55,7 @@ P0 是“可控用户、预充值/管理员授信、单实例”的生产版本�
 6. Provider、Model、Credential、Credential Pool、加密 secret metadata；
 7. public model 到 route target 的 exact match 路由；
 8. 确定性、可解释的 Scheduler（优先级 + 稳定 round-robin；硬过滤和 Decision Log 必须完整）；
-9. CPA v7.2.145 adapter 的非流式、流式、取消和错误映射兼容测试；
+9. CPA v7.2.149 adapter 的非流式、流式、取消和错误映射兼容测试；
 10. `/v1/models`、Chat Completions、Responses，包含 stream/non-stream、首包前/后错误和客户端取消；
 11. 自有 immutable UsageEvent、价格快照、预算预检/预留、Wallet Ledger、结算和失败重试；
 12. 管理员 credit/adjustment 与一次性 voucher 已实现为 P0 资金入口；Stripe Checkout/webhook/refund adapter 已建立，但没有真实 test-mode E2E 证据时 self-service Stripe 支付不得标为生产可用；
@@ -67,8 +67,8 @@ P0 上线门禁仍要求真实 PostgreSQL/Redis、CPA compatibility suite、一�
 ### 4.2 P1 增强
 
 - self-service 支付 Provider（按官方规范验签、金额核对、防重放、幂等）并完成 sandbox E2E；
-- quota snapshot poller、staleness/conservative policy、429 cooldown；
-- weighted/fill-first/quota-aware scheduler；
+- quota snapshot poller、staleness/conservative policy、429 cooldown 已落地为 Claude/Codex 合法被动 response-header observation；更多 Provider 不猜测接口；
+- weighted/fill-first/quota-aware scheduler 已实现为显式可选策略；默认仍为确定性 priority + round-robin，真实 Provider quota-aware E2E 仍需发布门禁证据；
 - Claude Messages、Gemini 等额外协议，逐协议建立契约测试；
 - route 版本生效时间、灰度/Canary、请求级 fallback trace；
 - 管理员和用户更完整的 Usage/账务页面；

@@ -89,7 +89,7 @@ func (s *Service) Select(ctx context.Context, request Request) (Selection, error
 			})
 			continue
 		}
-		members, err := s.repository.loadPoolMembers(ctx, target.CredentialPoolID, request.Quota)
+		members, err := s.repository.loadPoolMembers(ctx, target.CredentialPoolID, request.Quota, target.UpstreamModelID)
 		if err != nil {
 			return Selection{Decision: decision}, err
 		}

@@ -136,7 +136,7 @@ bablo auth reset-password --email user@example.com
 - `GET /api/v1/admin/usage`
 - `GET /api/v1/admin/requests/{request_id}`
 - `GET /api/v1/admin/scheduler/decisions`
-- `GET /api/v1/admin/credentials/{id}/quota`
+- `GET /api/v1/admin/credentials/{id}/quota?window_kind=&limit=`：返回 bounded `state`、按 `observed_at` 倒序的 quota snapshots 和 supported probes；`window_kind` 为空表示全部受支持窗口，`limit` 有界；只读、`Cache-Control: no-store`，不返回 Credential secret、Prompt 或响应正文。
 - `POST /api/v1/admin/wallets/{user_id}/adjustments`
 - `GET /api/v1/admin/payment-orders`
 - `POST /api/v1/admin/payment-orders/{order_no}/close`

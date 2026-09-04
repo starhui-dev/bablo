@@ -25,7 +25,7 @@ Scheduler 两阶段执行：
 
 Redis 只存带 TTL 的 concurrency lease、affinity、RR cursor；quota snapshot 来自带 `observed_at`/confidence 的 poller，stale/missing 按保守策略处理。所有 lease 使用 owner token finally/recovery 释放。
 
-- 实现于 2026-08-30：`internal/scheduler` 已按上述边界落地；`migrations/000009_scheduler_integrity.sql` 记录 resolved route/provider/credential 并校验选择归属，`credentials.max_concurrency` 定义每个 Credential 的 TTL lease 槽位数。`internal/proxy` 已在每次请求中先调用 Route resolver、再调用 Scheduler 并执行 CPA；`internal/usage` 已接入 immutable UsageEvent、reconciliation 和 transactional outbox；真实上游错误/配额反馈和 Wallet 结算仍由后续阶段接入。
+- 实现于 2026-08-30 至 2026-09-04：`internal/scheduler` 已按上述边界落地；`migrations/000009_scheduler_integrity.sql` 记录 resolved route/provider/credential 并校验选择归属，`credentials.max_concurrency` 定义每个 Credential 的 TTL lease 槽位数；`internal/quota` 与 `000019_quota_observation.sql` 提供 provider/model 对齐的 immutable snapshot、freshness/reset、health/cooldown 和 Redis TTL probe lease，`internal/proxy` 已在每次请求中先调用 Route resolver、再调用 Scheduler 并执行 CPA；`internal/usage` 已接入 immutable UsageEvent、reconciliation 和 transactional outbox。真实上游错误/配额反馈、stats 消费者和 Wallet 结算的生产 E2E 仍需外部门禁证据。
 
 ## 后果
 

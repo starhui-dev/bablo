@@ -1,8 +1,7 @@
 # Bablo
 
-Bablo 是面向多用户、多 API Key、多模型的生产级 AI Gateway：自研控制面，使用隔离的 CPA SDK adapter 作为 inference engine。
+Bablo 是面向多用户、多 API Key、多模型的生产级 AI Gateway：自研控制面，使用隔离的 CPA SDK adapter 作为 inference engine。当前已完成架构规划、基础工程、身份与目录控制面、路由调度、推理 Proxy、Usage/Billing/Payment 内核和 quota 观测层；真实上游、支付和发布门禁仍未放行。
 
-> 当前已完成架构规划、bootstrap、CPA adapter、PostgreSQL/Redis data layer、Web Session auth、API Key 与模型/Provider/价格目录 P0；推理数据面和 route/scheduler 尚未实现。
 
 ## 已确定的架构边界
 
@@ -19,7 +18,7 @@ Bablo 是面向多用户、多 API Key、多模型的生产级 AI Gateway：自�
 当前核验的稳定版本为：
 
 ```text
-github.com/router-for-me/CLIProxyAPI/v7 v7.2.145
+github.com/router-for-me/CLIProxyAPI/v7 v7.2.149
 ```
 
 该版本的 module 要求 Go 1.26.0。CPA 版本、公开 SDK 包、源码核验结果和 `docs/sdk-usage.md` 漂移记录见 [`docs/upstream-compatibility.md`](docs/upstream-compatibility.md)。
@@ -39,9 +38,9 @@ github.com/router-for-me/CLIProxyAPI/v7 v7.2.145
 - [ADR：模型路由与 Scheduler](docs/adr/0004-model-routing-and-scheduler.md)
 - [ADR：Web Session 认证](docs/adr/0005-web-session-authentication.md)
 
-项目按 `docs/implementation-status.md` 中的阶段顺序推进。plan、bootstrap、CPA adapter、data/auth/API Key、模型与 Credential 目录、路由、调度、推理 Proxy、Usage、Billing 和 Payment 内核已完成；Stripe Checkout/webhook/refund adapter 已精确锁定并通过本地契约/数据库测试，但真实 Stripe test-mode E2E 尚未执行，不能视为生产支付已放行。
+项目按 `docs/implementation-status.md` 中的阶段顺序推进。Quota 已实现 PostgreSQL immutable snapshot、被动响应头观测、受控 probe/health worker、Redis TTL credential lease、staleness 计算和管理员查询 API；统计聚合是下一阶段。真实 Provider/OAuth/支付、备份恢复和回滚验证仍属于发布门禁。
 
-下一阶段：`/bablo-quota`。
+下一阶段：`/bablo-stats`。
 
 ## 安全与上线
 

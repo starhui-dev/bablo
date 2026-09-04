@@ -129,11 +129,21 @@ func (a *Adapter) RemoveCredential(ctx context.Context, credentialID string) err
 	return nil
 }
 
-// MarkCredentialResult forwards a safe execution observation to CPA cooldown
-// logic. Bablo persists the authoritative health observation separately.
+// MarkCredentialResult accepts only a fully identified result for callers that
+// execute outside CPA's Manager. Normal Manager execution already records its
+// own result; Proxy does not wire this callback for CPA to avoid double-counting
+// and accidentally clearing Manager quota state.
 func (a *Adapter) MarkCredentialResult(ctx context.Context, result inference.CredentialResult) {
 	if a == nil || a.manager == nil || strings.TrimSpace(result.CredentialID) == "" {
 		return
+	}
+	provider := strings.TrimSpace(result.Provider)
+	model := strings.TrimSpace(result.Model)
+	if provider == "" || model == "" {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	var retryAfter *time.Duration
 	if result.CooldownUntil != nil {
@@ -144,12 +154,24 @@ func (a *Adapter) MarkCredentialResult(ctx context.Context, result inference.Cre
 	}
 	var resultError *auth.Error
 	if !result.Succeeded {
-		resultError = &auth.Error{Code: result.ErrorClass, Message: result.ErrorClass}
+		resultError = &auth.Error{
+			Code:       strings.TrimSpace(result.ErrorClass),
+			Message:    strings.TrimSpace(result.ErrorClass),
+			HTTPStatus: result.HTTPStatus,
+		}
+		if resultError.Code == "" {
+			resultError.Code = "credential_failure"
+			resultError.Message = "credential execution failed"
+		}
 	}
 	a.manager.MarkResult(ctx, auth.Result{
-		AuthID:     result.CredentialID,
-		Success:    result.Succeeded,
-		RetryAfter: retryAfter,
-		Error:      resultError,
+		AuthID:               result.CredentialID,
+		Provider:             provider,
+		Model:                model,
+		RouteModel:           strings.TrimSpace(result.RouteModel),
+		Success:              result.Succeeded,
+		RetryAfter:           retryAfter,
+		Error:                resultError,
+		SkipQuotaObservation: true,
 	})
 }

@@ -23,6 +23,7 @@ import (
 	catalogmodel "github.com/starhui-dev/bablo/internal/model"
 	"github.com/starhui-dev/bablo/internal/pricing"
 	"github.com/starhui-dev/bablo/internal/provider"
+	"github.com/starhui-dev/bablo/internal/quota"
 	"github.com/starhui-dev/bablo/internal/route"
 	"github.com/starhui-dev/bablo/internal/scheduler"
 	"github.com/starhui-dev/bablo/internal/usage"
@@ -1280,5 +1281,37 @@ func TestHandlerMapsRequestBodyLimitTo413(t *testing.T) {
 	}
 	if len(engine.executeCalls) != 0 || len(engine.streamCalls) != 0 {
 		t.Fatalf("oversized request reached engine: execute=%d stream=%d", len(engine.executeCalls), len(engine.streamCalls))
+	}
+}
+
+func TestHandlerPassesQuotaPolicyAndEstimatedTokensToScheduler(t *testing.T) {
+	handler, _, _, _, schedulerService, engine, _, _, _ := newProxyFixture(t)
+	handler.quotaPolicy = scheduler.QuotaPolicy{
+		Enabled:      true,
+		WindowKind:   quota.WindowProviderSpecific,
+		MaxAge:       2 * time.Minute,
+		RequireFresh: true,
+	}
+	engine.result = inference.ExecutionResult{
+		StatusCode: http.StatusOK,
+		Body:       []byte(`{"id":"quota-policy"}`),
+	}
+	body := `{"model":"bablo-chat","max_output_tokens":20}`
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(body))
+	request.Header.Set("X-Request-ID", "req-quota-policy")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(schedulerService.calls) != 1 {
+		t.Fatalf("scheduler calls = %d, want 1", len(schedulerService.calls))
+	}
+	policy := schedulerService.calls[0].Quota
+	wantTokens := estimateTokens([]byte(body)) + 20
+	if !policy.Enabled || policy.WindowKind != quota.WindowProviderSpecific || !policy.RequireFresh || policy.MaxAge != 2*time.Minute || policy.RequiredTokens != wantTokens {
+		t.Fatalf("scheduler quota policy = %+v, want enabled provider-specific fresh %d tokens", policy, wantTokens)
 	}
 }

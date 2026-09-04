@@ -19,6 +19,7 @@ import (
 	"github.com/starhui-dev/bablo/internal/inference/cpa"
 	"github.com/starhui-dev/bablo/internal/payment"
 	"github.com/starhui-dev/bablo/internal/proxy"
+	"github.com/starhui-dev/bablo/internal/quota"
 	"github.com/starhui-dev/bablo/internal/scheduler"
 	"github.com/starhui-dev/bablo/internal/secret"
 	"github.com/starhui-dev/bablo/internal/usage"
@@ -63,6 +64,12 @@ func run(arguments []string) int {
 		logger.Error("bablo_payment_config_error", "error", err)
 		return 1
 	}
+	quotaCfg, err := config.LoadQuota(cfg.Environment)
+	if err != nil {
+		logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+		logger.Error("bablo_quota_config_error", "error", err)
+		return 1
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	var store *data.Store
 	var authHandler *auth.Handler
@@ -75,6 +82,8 @@ func run(arguments []string) int {
 	var cpaAdapter *cpa.Adapter
 	var billingService *billing.Service
 	var paymentService *payment.Service
+	var quotaService *quota.Service
+	var quotaLocker quota.Locker
 	if len(credentialCfg.Keys) > 0 {
 		credentialKeys, err = secret.NewKeyring(credentialCfg.CurrentVersion, credentialCfg.Keys)
 		if err != nil {
@@ -98,6 +107,46 @@ func run(arguments []string) int {
 			return 1
 		}
 		defer store.Close()
+
+		if quotaCfg.Enabled && cfg.RedisURL != "" {
+			quotaCtx, quotaCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			quotaLocker, err = quota.NewRedisLocker(quotaCtx, cfg.RedisURL)
+			quotaCancel()
+			if err != nil {
+				logger.Error("bablo_quota_locker_error", "error", err)
+				return 1
+			}
+			redisReady = true
+		} else {
+			quotaLocker = quota.NewMemoryLocker()
+		}
+		quotaRepository, quotaErr := quota.NewRepository(store)
+		if quotaErr != nil {
+			logger.Error("bablo_quota_repository_error", "error", quotaErr)
+			return 1
+		}
+		quotaService, quotaErr = quota.NewService(quotaRepository, quota.Options{
+			Locker:             quotaLocker,
+			HealthReporter:     nil,
+			PollInterval:       quotaCfg.PollInterval,
+			ProbeTimeout:       quotaCfg.ProbeTimeout,
+			LeaseTTL:           quotaCfg.LeaseTTL,
+			MaxBackoff:         quotaCfg.MaxBackoff,
+			AuthBackoff:        quotaCfg.AuthBackoff,
+			UnsupportedBackoff: quotaCfg.UnsupportedBackoff,
+			SnapshotMaxAge:     quotaCfg.SnapshotMaxAge,
+			BatchSize:          quotaCfg.BatchSize,
+			JitterRatio:        quotaCfg.JitterRatio,
+		})
+		if quotaErr != nil {
+			logger.Error("bablo_quota_service_error", "error", quotaErr)
+			return 1
+		}
+		defer func() {
+			if closeErr := quotaService.Close(); closeErr != nil {
+				logger.Error("bablo_quota_close_error", "error", closeErr)
+			}
+		}()
 
 		if len(authCfg.EncryptionKey) > 0 {
 			secretBox, err := auth.NewSecretBox(authCfg.EncryptionKey, authCfg.KeyVersion)
@@ -266,10 +315,13 @@ func run(arguments []string) int {
 		if authHandler != nil {
 			serverOptions = append(serverOptions, httpapi.WithAPIKeyHandler(authHandler.Protect(apiKeyHandler)))
 		}
-		catalog, err = newCatalogRuntime(store, authHandler, credentialKeys, logger)
+		catalog, err = newCatalogRuntime(store, authHandler, credentialKeys, logger, quotaService)
 		if err != nil {
 			logger.Error("bablo_catalog_error", "error", err)
 			return 1
+		}
+		if quotaService != nil && catalog.credentialService != nil {
+			quotaService.SetHealthReporter(quotaHealthReporter{service: catalog.credentialService})
 		}
 		serverOptions = append(serverOptions, catalog.options...)
 		if cfg.CPAConfigPath == "" {
@@ -302,7 +354,7 @@ func run(arguments []string) int {
 				logger.Error("bablo_scheduler_repository_error", "error", schedulerErr)
 				return 1
 			}
-			schedulerService, schedulerErr := scheduler.NewService(schedulerRepository, schedulerCoordinator, scheduler.Options{})
+			schedulerService, schedulerErr := scheduler.NewService(schedulerRepository, schedulerCoordinator, scheduler.Options{QuotaMaxAge: quotaCfg.SnapshotMaxAge})
 			if schedulerErr != nil {
 				logger.Error("bablo_scheduler_service_error", "error", schedulerErr)
 				return 1
@@ -322,6 +374,20 @@ func run(arguments []string) int {
 			if err != nil {
 				logger.Error("bablo_cpa_adapter_error", "error", err)
 				return 1
+			}
+			if quotaService != nil {
+				if registerErr := quotaService.RegisterQuotaProbe(cpaAdapter); registerErr != nil {
+					logger.Error("bablo_quota_probe_register_error", "error", registerErr)
+					return 1
+				}
+				if registerErr := quotaService.RegisterHealthProbe(cpa.NewHealthProbe(cpaAdapter)); registerErr != nil {
+					logger.Error("bablo_health_probe_register_error", "error", registerErr)
+					return 1
+				}
+				if registerErr := quotaService.RegisterResponseObserver(cpaAdapter); registerErr != nil {
+					logger.Error("bablo_quota_observer_register_error", "error", registerErr)
+					return 1
+				}
 			}
 			defer func() {
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
@@ -345,18 +411,28 @@ func run(arguments []string) int {
 				logger.Error("bablo_cpa_ready_error", "error", err)
 				return 1
 			}
+			var schedulerQuotaPolicy scheduler.QuotaPolicy
+			if quotaCfg.SchedulerQuotaEnabled {
+				schedulerQuotaPolicy = scheduler.QuotaPolicy{
+					Enabled:      true,
+					WindowKind:   quotaCfg.SchedulerWindowKind,
+					MaxAge:       quotaCfg.SnapshotMaxAge,
+					RequireFresh: quotaCfg.SchedulerRequireFresh,
+				}
+			}
 			inferenceHandler, handlerErr := proxy.NewHandler(proxy.Options{
-				APIKeys:         apiKeyService,
-				Models:          catalog.modelService,
-				Routes:          catalog.routeService,
-				Scheduler:       schedulerService,
-				Engine:          cpaAdapter,
-				HealthReporter:  catalog.credentialService,
-				RuntimeReporter: cpaAdapter,
-				UsageRecorder:   usageService,
-				PriceResolver:   catalog.pricingService,
-				Logger:          logger,
-				Billing:         billingService,
+				APIKeys:        apiKeyService,
+				Models:         catalog.modelService,
+				Routes:         catalog.routeService,
+				Scheduler:      schedulerService,
+				Engine:         cpaAdapter,
+				HealthReporter: catalog.credentialService,
+				QuotaObserver:  quotaService,
+				UsageRecorder:  usageService,
+				PriceResolver:  catalog.pricingService,
+				Logger:         logger,
+				Billing:        billingService,
+				QuotaPolicy:    schedulerQuotaPolicy,
 			})
 			if handlerErr != nil {
 				logger.Error("bablo_proxy_handler_error", "error", handlerErr)
@@ -393,6 +469,9 @@ func run(arguments []string) int {
 	}
 	if billingService != nil {
 		go billingService.RunSettlementRecoveryWorker(ctx, time.Minute, logger)
+	}
+	if quotaService != nil && quotaCfg.Enabled && cpaAdapter != nil {
+		go quotaService.Run(ctx, logger)
 	}
 
 	errCh := make(chan error, 1)

@@ -1,7 +1,7 @@
 # Bablo 数据模型规划
 
-> 已由 `migrations/000001_initial_schema.sql` 至 `000018_billing_liability_integrity.sql` 增量落地；后续迁移必须新增版本文件，不得重写已应用文件。
-> 日期：2026-08-29
+> 已由 `migrations/000001_initial_schema.sql` 至 `000019_quota_observation.sql` 增量落地；后续迁移必须新增版本文件，不得重写已应用文件。
+> 日期：2026-09-04
 > 事实来源：PostgreSQL；Redis 只存可重建状态
 
 ## 1. 全局规则
@@ -50,6 +50,7 @@ erDiagram
     USAGE_EVENTS }o--|| API_KEYS : attributed_to
     USAGE_EVENTS }o--|| ROUTE_VERSIONS : resolved_by
     CREDENTIALS ||--o{ QUOTA_SNAPSHOTS : observed
+    CREDENTIALS ||--o| QUOTA_PROBE_STATES : schedules
     CREDENTIALS ||--|| CREDENTIAL_HEALTH : reports
     REQUEST_RECORDS ||--o{ REQUEST_ATTEMPTS : includes
     REQUEST_RECORDS ||--o| USAGE_EVENTS : settles
@@ -82,7 +83,8 @@ erDiagram
 
 ### Quota / pricing
 
-- `quota_snapshots`：credential、window kind、used/remaining/limit（可空）、reset_at、observed_at、source、confidence、error、stale 计算信息；采集失败不刷新 `observed_at`；
+- `quota_snapshots`：credential、provider/model、observation key、window kind、used/remaining/limit（可空）、reset_at、observed_at、source、confidence、error、bounded metadata、stale 计算信息；采集失败不刷新 `observed_at`；
+- `quota_probe_states`：每个 Credential 一行的 probe/status/last attempt/last observation/next attempt/failure/backoff/error state；仅为可重建 worker 状态，不是 quota 事实。
 - `price_versions`：scope、version、effective_from/to、currency、status、created_by；只有 active/retired 且请求时刻位于 effective window 的已发布版本可创建非零 reservation；
 - `model_prices`：price version、resolved provider model 或 billing scope、input/output/cache-read/cache-write/reasoning/per-request 单价；`unit_price` 是主货币单位/一个维度单位的 decimal，缺价不得静默按 0。
 
@@ -124,6 +126,7 @@ erDiagram
 | entitlement | `(policy_id, model_id)` |
 | provider/model | `(provider_id, upstream_model_id)`；发现和人工映射共用稳定上游 identity |
 | credential | `(provider_id, external_stable_id)`（无稳定 ID 时用受控 fingerprint） |
+| quota snapshot | `(credential_id, observation_key, window_kind)`；同一 observation key 的 payload 必须完全一致，冲突拒绝；probe state 每 Credential 一行且为可重建状态 |
 | pool membership | `(pool_id, credential_id)` |
 | route version | `(route_id, version_no)`；target 顺序/目标 identity 在同一 version 内唯一 |
 | public model/alias | `lower(public_model_id)`、`lower(alias)` 各自唯一且跨表互斥；禁用 alias 仍保留占位 |
@@ -182,11 +185,13 @@ Raw Usage、scheduler/audit、payment payload hash 和 rollup 的 retention 必�
 - `migrations/000016_payment_financial_recovery.sql` 增加 pending settlement recovery lease、wallet financial hold、liability 和人工充值幂等事实；
 - `migrations/000017_payment_provider_recovery.sql` 增加 PaymentIntent/Charge/Dispute、external refund/dispute 表及 order-wallet-ledger 跨表约束；
 - `migrations/000018_billing_liability_integrity.sql` 以数据库唯一约束保证一个 Provider financial reference 只能产生一条 liability；
+- `migrations/000019_quota_observation.sql` 增加 provider/model/observation key、metadata、immutable quota snapshot 和可重建 probe state 约束。
 - `internal/model` 实现 canonical ID/alias 解析、public/admin 列表、能力/visibility/billing class 校验和 route readiness；alias 禁用后不被重新分配。
 - `internal/provider` 实现资源政策、上游模型映射和完整 discovery snapshot reconcile；新增发现 pending/disabled，缺失只改变 discovery signal，批准配置不被发现覆盖。
 - `internal/credential` 实现 non-secret DTO、AES-GCM secret create/rotate/reencrypt、active runtime source、monotonic health、Provider pool membership 和 opaque composite cursor；管理员 API 永不返回 secret value。
 - `internal/pricing` 使用 decimal string + `numeric(30,12)`，实现 draft/activate/retire 与 provider_model -> model -> global 价格解析；缺价/禁用计费 fail closed。
 - `internal/route` 实现 P0 exact route、多 Provider/Pool candidate、snapshot hash、active version 原子切换、opaque cursor、preview/resolution 和管理员 API；resolver 只产出 scheduler candidates，不选择 Credential。
+- `internal/quota` 实现合法 Provider quota/health probe、被动 response observation、snapshot freshness/staleness、退避、Redis TTL lease 和 admin view；只向 Scheduler 提供 Bablo 标准化快照，不暴露 CPA 类型。
 - `internal/scheduler` 实现 target/member 硬过滤、429 cooldown、quota freshness/reset、priority/fill-first/round-robin/weighted-round-robin/quota-aware、有限 affinity、Redis/内存 TTL lease/cursor/affinity 和 immutable Decision Log；它只接收 Route resolution，不暴露 CPA 类型。
 - `internal/usage` 实现 request record 幂等、immutable UsageEvent、stream/cancel/no-usage 状态、late reconciliation、transactional outbox claim/ack/retry；Proxy 只提交领域输入，不暴露 CPA 类型或正文。
 - `internal/billing` 使用 decimal string + `math/big` 汇总后一次换算最小货币单位，实现 Quote/Reserve/Settle/Release/Credit、payment refund hold、liability、pending settlement recovery、GetWallet/RebuildBalance；Proxy 在 CPA 执行前 reserve、UsageEvent 后 settle，missing usage 按 reservation 估算结算；

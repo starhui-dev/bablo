@@ -1,7 +1,7 @@
 # Bablo 总体架构
 
 > 版本：架构规划基线
-> 日期：2026-08-31
+> 日期：2026-09-04
 > 相关 ADR：`docs/adr/0001-cpa-sdk-boundary.md`、`docs/adr/0002-postgres-source-of-truth.md`、`docs/adr/0003-usage-ledger-billing.md`、`docs/adr/0004-model-routing-and-scheduler.md`、`docs/adr/0005-web-session-authentication.md`
 
 ## 1. 架构结论
@@ -21,7 +21,7 @@ flowchart LR
     D --> SCH[Deterministic Scheduler]
     SCH --> CPA[internal/inference/cpa
 Bablo InferenceEngine adapter]
-    CPA --> UP[CPA SDK v7.2.145 / upstream]
+    CPA --> UP[CPA SDK v7.2.149 / upstream]
     S --> O[Transactional Outbox + workers]
     O --> ST[Stats rollup / audit / reconciliation]
 ```
@@ -60,6 +60,7 @@ Bablo InferenceEngine adapter]
 | `credential` | 加密 secret metadata、健康、pool membership、active runtime source | Credential ID、非敏感 metadata、transient runtime credential | 日志输出 token、让 subscription 默认商业可用 |
 | `route` | public model 到版本化 target 的匹配/快照 | route snapshot、candidate targets | 未授权 fallback、请求中途变更快照 |
 | `scheduler` | 硬过滤、确定性选择、租约、Decision Log | candidates、policy、quota snapshot | 隐式随机、选择 disabled/revoked credential |
+| `quota` | 合法 Provider quota/health 观测、immutable snapshot、staleness、退避和 probe lease | `QuotaProbe`/`HealthProbe`/`ResponseObserver`、Scheduler quota policy | 猜测未公开 endpoint、把旧 snapshot 当新值、把 opaque signal 推导成 token 容量 |
 | `usage` | request/attempt、immutable UsageEvent、reconcile/outbox | token/status/latency、settlement key | 依赖 CPA usage queue 作为最终账 |
 | `pricing` | price version、resolved target 价格 | 已发布 price snapshot | 用 float、重写历史价格、让 draft 入账 |
 | `wallet/billing` | exact quote、reservation、settlement、charge/release/refund/adjustment、budget | ledger entry、pending settlement、balance projection | UPDATE 历史 ledger、并发透支、只按 alias 计费 |
@@ -88,6 +89,14 @@ Bablo InferenceEngine adapter]
 `route.Service` 只负责把 requested public model/alias 解析为一个固定的 `route_version` 和有序 candidate targets；它不读取 API Key secret、不解密 Credential、不选择 pool member，也不执行上游请求。P0 仅支持 exact match，Route 创建或发布新版本在同一 PostgreSQL transaction 中校验 provider-model/pool 的 Provider 归属、模型映射和商业政策，关闭旧 version 后原子切换 `model_routes.active_version_id`。
 
 `route_versions` 与 `route_targets` 作为 immutable snapshot 保存；旧 version 只允许一次性写入 `effective_to`。管理员 preview 只返回 route candidates，不触发 scheduler 或 Credential runtime。推理流水线必须先完成 API Key entitlement，再使用 resolver 输出交给 scheduler。
+
+### Quota 调用边界
+
+`internal/quota.Service` 只接收 Bablo `QuotaProbe`、`HealthProbe`、`ResponseObserver` 和 `Persistence` 接口。Proxy 在真实上游响应完成后只传递已 allowlist 的安全 response headers；observer 必须是被动的，不得再发上游请求。当前 CPA v7.2.149 public signal API 仅支持 Claude/Codex，adapter 不为 Gemini、Grok 或未知 Provider 猜测 quota endpoint。
+
+主动 worker 从 PostgreSQL 解析 Credential/Provider 身份，使用 Redis `SET NX PX` owner-token lease（无 Redis 时仅 P0 单实例使用内存 lease），在一个受租约期限约束的探测周期内执行 quota probe 和 health probe。成功的每个 window 与 probe state 在同一 PostgreSQL transaction 提交；重复 observation key 必须相同，否则返回冲突；失败只更新可重建 state 和退避，不刷新 `observed_at`。View 按 `observed_at`、`reset_at` 和配置的 max age 计算 stale。Scheduler 只有显式启用 `QuotaPolicy` 才读取快照，`RequireFresh` 对 missing/stale 保守拒绝，未知 token 数值不推导容量。
+
+管理员通过 `GET /api/v1/admin/credentials/{id}/quota` 查询有限 snapshot/state；响应不含 secret、Prompt 或响应正文。Quota worker 错误不会改变 PostgreSQL 账务事实，也不会绕过 Credential health/cooldown。
 
 ### Billing 调用边界
 

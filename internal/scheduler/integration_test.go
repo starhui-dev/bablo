@@ -166,13 +166,16 @@ func TestQuotaFreshnessAndAffinityFailover(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	old := now.Add(-10 * time.Minute)
+	// Scheduler only consumes a snapshot for the resolved provider model; seed the
+	// fixture with that exact identity so quota eligibility is tested, not bypassed.
+	target := fixture.resolution.Candidates[0]
 	if _, err := fixture.store.Queryer().Exec(ctx, `
-		INSERT INTO quota_snapshots (id, credential_id, window_kind, remaining_tokens, reset_at, observed_at, source, confidence)
-		VALUES ($1, $2, 'minute', 1, $3, $4, 'test', 'high'),
-		       ($5, $6, 'minute', 100, $3, $4, 'test', 'high'),
-		       ($7, $8, 'minute', 100, $9, $4, 'test', 'high'),
-		       ($10, $11, 'minute', 100, $3, $12, 'test', 'high')`,
-		uuid.New(), fixture.credentials[0], now.Add(time.Hour), now,
+		INSERT INTO quota_snapshots (id, credential_id, provider_slug, model, observation_key, window_kind, remaining_tokens, reset_at, observed_at, source, confidence)
+		VALUES ($1, $2, $3, $4, 'scheduler-1', 'minute', 1, $5, $6, 'test', 'high'),
+		       ($7, $8, $3, $4, 'scheduler-2', 'minute', 100, $5, $6, 'test', 'high'),
+		       ($9, $10, $3, $4, 'scheduler-3', 'minute', 100, $11, $6, 'test', 'high'),
+		       ($12, $13, $3, $4, 'scheduler-4', 'minute', 100, $5, $14, 'test', 'high')`,
+		uuid.New(), fixture.credentials[0], target.ProviderSlug, target.UpstreamModelID, now.Add(time.Hour), now,
 		uuid.New(), fixture.credentials[1],
 		uuid.New(), fixture.credentials[2], now.Add(-time.Minute),
 		uuid.New(), fixture.credentials[3], old); err != nil {

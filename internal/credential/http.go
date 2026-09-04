@@ -14,6 +14,7 @@ import (
 
 	"github.com/starhui-dev/bablo/internal/auth"
 	"github.com/starhui-dev/bablo/internal/httpapi"
+	"github.com/starhui-dev/bablo/internal/quota"
 )
 
 const (
@@ -24,19 +25,28 @@ const (
 
 type handler struct {
 	service *Service
+	quota   quota.Viewer
 	logger  *slog.Logger
 }
 
 // NewHandler creates the administrator-only Credential and pool HTTP surface.
-// Secret values are accepted for create/rotate but never returned.
-func NewHandler(service *Service, logger *slog.Logger) (http.Handler, error) {
+// Secret values are accepted for create/rotate but never returned. The optional
+// quota viewer adds GET /credentials/{id}/quota without changing old callers.
+func NewHandler(service *Service, logger *slog.Logger, viewers ...quota.Viewer) (http.Handler, error) {
 	if service == nil {
 		return nil, errors.New("credential HTTP handler requires a service")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &handler{service: service, logger: logger}, nil
+	var viewer quota.Viewer
+	if len(viewers) > 1 {
+		return nil, errors.New("credential HTTP handler accepts at most one quota viewer")
+	}
+	if len(viewers) == 1 {
+		viewer = viewers[0]
+	}
+	return &handler{service: service, quota: viewer, logger: logger}, nil
 }
 
 type createRequest struct {
@@ -202,6 +212,12 @@ func (h *handler) serveCredentialResource(w http.ResponseWriter, r *http.Request
 			return
 		}
 		h.getHealth(w, r, credentialID)
+	case "quota":
+		if r.Method != http.MethodGet {
+			h.methodNotAllowed(w, r, "GET")
+			return
+		}
+		h.getQuota(w, r, credentialID)
 	default:
 		h.writeError(w, r, ErrNotFound)
 	}
@@ -256,6 +272,23 @@ func (h *handler) rotateCredential(w http.ResponseWriter, r *http.Request, crede
 	writeJSON(w, http.StatusOK, map[string]any{"credential": value})
 }
 
+func (h *handler) getQuota(w http.ResponseWriter, r *http.Request, credentialID uuid.UUID) {
+	if h.quota == nil {
+		h.writeError(w, r, quota.ErrStateUnavailable)
+		return
+	}
+	limit, err := parseLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		h.writeError(w, r, ErrInvalidInput)
+		return
+	}
+	view, err := h.quota.View(r.Context(), credentialID, r.URL.Query().Get("window_kind"), limit)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"quota": view})
+}
 func (h *handler) reencryptCredential(w http.ResponseWriter, r *http.Request, credentialID uuid.UUID) {
 	session, ok := auth.SessionFromContext(r.Context())
 	if !ok {
@@ -438,6 +471,14 @@ func (h *handler) writeError(w http.ResponseWriter, r *http.Request, err error) 
 
 func publicError(err error) (int, string, string, string) {
 	switch {
+	case errors.Is(err, errMethodNotAllowed):
+		return http.StatusMethodNotAllowed, "invalid_request", "method_not_allowed", "请求方法不受支持。"
+	case errors.Is(err, quota.ErrInvalidInput):
+		return http.StatusBadRequest, "invalid_request", "invalid_quota_request", "配额查询参数不符合要求。"
+	case errors.Is(err, quota.ErrNotFound):
+		return http.StatusNotFound, "not_found", "quota_credential_not_found", "Credential 不存在。"
+	case errors.Is(err, quota.ErrStateUnavailable), errors.Is(err, quota.ErrProbeUnavailable):
+		return http.StatusServiceUnavailable, "quota_error", "quota_unavailable", "配额服务暂时不可用。"
 	case errors.Is(err, errMethodNotAllowed):
 		return http.StatusMethodNotAllowed, "invalid_request", "method_not_allowed", "请求方法不受支持。"
 	case errors.Is(err, ErrInvalidInput):

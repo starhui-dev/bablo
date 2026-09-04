@@ -224,8 +224,8 @@ func TestAdapterCapabilitiesReturnsCopyAndVersion(t *testing.T) {
 			ModelIDs:  []string{"model-a"},
 		},
 	})
-	if got := adapter.SDKVersion(); got != "v7.2.145" {
-		t.Fatalf("SDKVersion() = %q, want v7.2.145", got)
+	if got := adapter.SDKVersion(); got != "v7.2.149" {
+		t.Fatalf("SDKVersion() = %q, want v7.2.149", got)
 	}
 	capabilities, err := adapter.Capabilities(context.Background())
 	if err != nil {
